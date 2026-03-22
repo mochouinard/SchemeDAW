@@ -69,6 +69,14 @@ int gui_sequencer_grid(int *grid_data, int rows, int cols, int current_step,
 void gui_set_daw_theme(void);
 int gui_get_width(void);
 int gui_get_height(void);
+
+/* Labeled sequencer grid: draws track labels on the left */
+int gui_sequencer_grid_labeled(int *grid_data, int rows, int cols,
+    int current_step, int cell_w, int cell_h,
+    const char **row_labels, float dpi_scale);
+
+/* Horizontal separator */
+void gui_separator(float height);
 float gui_get_dpi_scale(void);
 ")
 
@@ -264,6 +272,60 @@ void gui_set_daw_theme(void) {
     g_ctx->style.button.rounding = 3;
     g_ctx->style.slider.bar_height = 6;
 }
+
+int gui_sequencer_grid_labeled(int *grid_data, int rows, int cols,
+    int current_step, int cell_w, int cell_h,
+    const char **row_labels, float dpi_scale) {
+    int changed = 0;
+    int label_w = (int)(70.0f * dpi_scale);
+
+    for (int r = 0; r < rows; r++) {
+        /* Row with label + grid cells */
+        nk_layout_row_begin(g_ctx, NK_STATIC, (float)cell_h, cols + 1);
+
+        /* Track label */
+        nk_layout_row_push(g_ctx, (float)label_w);
+        struct nk_color label_clr = (r < 4) ? nk_rgb(80,180,220) : nk_rgb(220,160,80);
+        nk_label_colored(g_ctx, row_labels[r], NK_TEXT_LEFT, label_clr);
+
+        /* Grid cells */
+        for (int c = 0; c < cols; c++) {
+            nk_layout_row_push(g_ctx, (float)cell_w);
+            int idx = r * cols + c;
+            int active = grid_data[idx];
+            struct nk_color clr;
+            if (c == current_step) {
+                clr = active ? nk_rgb(255,180,50) : nk_rgb(70,70,45);
+            } else {
+                if (active)
+                    clr = (r < 4) ? nk_rgb(60,160,200) : nk_rgb(200,140,50);
+                else
+                    clr = (c % 4 == 0) ? nk_rgb(52,52,56) : nk_rgb(42,42,46);
+            }
+            struct nk_style_button style = g_ctx->style.button;
+            style.normal = nk_style_item_color(clr);
+            style.hover = nk_style_item_color(nk_rgb(
+                (int)fminf(clr.r * 1.3f, 255),
+                (int)fminf(clr.g * 1.3f, 255),
+                (int)fminf(clr.b * 1.3f, 255)));
+            style.active = nk_style_item_color(nk_rgb(220,220,220));
+            style.border_color = nk_rgb(55,55,60);
+            style.border = 1.0f;
+            style.rounding = 2.0f;
+            if (nk_button_label_styled(g_ctx, &style, active ? \"#\" : \"\")) {
+                grid_data[idx] = !grid_data[idx];
+                changed = 1;
+            }
+        }
+        nk_layout_row_end(g_ctx);
+    }
+    return changed;
+}
+
+void gui_separator(float height) {
+    nk_layout_row_dynamic(g_ctx, height, 1);
+    nk_label(g_ctx, \"\", NK_TEXT_LEFT);
+}
 ")
 
 ;; ---- FFI Bindings ----
@@ -301,10 +363,87 @@ void gui_set_daw_theme(void) {
 (define gui-get-width  (foreign-lambda int "gui_get_width"))
 (define gui-get-height (foreign-lambda int "gui_get_height"))
 (define gui-get-dpi-scale (foreign-lambda float "gui_get_dpi_scale"))
+(define gui-separator (foreign-lambda void "gui_separator" float))
+
+;; Labeled grid FFI - needs C string array
+(define gui-sequencer-grid-labeled-raw
+  (foreign-lambda int "gui_sequencer_grid_labeled"
+    c-pointer int int int int int c-pointer float))
 
 ;; Scale a value by DPI
 (define (dpi* val)
   (inexact->exact (round (* val (gui-get-dpi-scale)))))
+
+;; ---- Save / Load ----
+
+(define (save-project! filename grid bpm track-presets track-volumes)
+  (call-with-output-file filename
+    (lambda (port)
+      (display ";; Audio DAC Project File\n" port)
+      (write `(project
+        (bpm ,bpm)
+        (presets ,(vector->list track-presets))
+        (volumes ,(map exact->inexact (vector->list track-volumes)))
+        (grid ,(let loop ((i 0) (acc '()))
+                 (if (>= i (* GRID_ROWS GRID_COLS))
+                     (reverse acc)
+                     (loop (+ i 1) (cons (grid-get grid i) acc))))))
+             port)
+      (newline port)))
+  (format #t "Saved project to ~A~%" filename))
+
+(define (load-project! filename grid track-presets track-volumes backend)
+  (condition-case
+    (let ((data (call-with-input-file filename read)))
+      (when (and (pair? data) (eq? (car data) 'project))
+        (let ((body (cdr data)))
+          ;; BPM
+          (let ((bpm-entry (assq 'bpm body)))
+            (when bpm-entry (set! *loaded-bpm* (cadr bpm-entry))))
+          ;; Presets
+          (let ((presets-entry (assq 'presets body)))
+            (when presets-entry
+              (let loop ((i 0) (ps (cadr presets-entry)))
+                (when (and (< i GRID_ROWS) (pair? ps))
+                  (vector-set! track-presets i (car ps))
+                  (backend-send backend CMD_LOAD_PRESET i (car ps) 0 0.0)
+                  (loop (+ i 1) (cdr ps))))))
+          ;; Volumes
+          (let ((vols-entry (assq 'volumes body)))
+            (when vols-entry
+              (let loop ((i 0) (vs (cadr vols-entry)))
+                (when (and (< i GRID_ROWS) (pair? vs))
+                  (vector-set! track-volumes i (car vs))
+                  (backend-send backend CMD_SET_VOLUME i 0 0
+                    (exact->inexact (car vs)))
+                  (loop (+ i 1) (cdr vs))))))
+          ;; Grid
+          (let ((grid-entry (assq 'grid body)))
+            (when grid-entry
+              (let loop ((i 0) (gs (cadr grid-entry)))
+                (when (and (< i (* GRID_ROWS GRID_COLS)) (pair? gs))
+                  (grid-set! grid i (car gs))
+                  (loop (+ i 1) (cdr gs))))))))
+      (format #t "Loaded project from ~A~%" filename))
+    ((exn) (format (current-error-port) "Error loading ~A~%" filename))))
+
+;; Global for passing loaded BPM back
+(define *loaded-bpm* #f)
+
+;; ---- C string array for row labels ----
+(define row-labels-alloc
+  (foreign-lambda* c-pointer ((int count))
+    "const char **arr = (const char **)calloc(count, sizeof(char*));
+     C_return(arr);"))
+
+(define row-labels-set!
+  (foreign-lambda* void ((c-pointer arr) (int idx) (c-string str))
+    "((const char **)arr)[idx] = str;"))
+
+(define row-labels-free
+  (foreign-lambda* void ((c-pointer arr))
+    "free(arr);"
+    ))
 
 ;; SDL delay for timing
 (foreign-declare "void c_delay_ms(int ms) { SDL_Delay(ms); }")
@@ -462,8 +601,9 @@ void gui_set_daw_theme(void) {
       (backend-destroy backend)
       (error "Failed to start audio"))
 
-    ;; Allocate sequencer grid
-    (let ((grid (grid-alloc (* GRID_ROWS GRID_COLS))))
+    ;; Allocate sequencer grid and row labels
+    (let ((grid (grid-alloc (* GRID_ROWS GRID_COLS)))
+          (c-row-labels (row-labels-alloc GRID_ROWS)))
 
       ;; DAW state
       (let ((bpm 120.0)
@@ -476,6 +616,10 @@ void gui_set_daw_theme(void) {
             (track-volumes (make-vector 8 0.8))
             (track-mutes (make-vector 8 #f))
             (track-solos (make-vector 8 #f)))
+
+        ;; Set up C row label array
+        (do ((i 0 (+ i 1))) ((>= i GRID_ROWS))
+          (row-labels-set! c-row-labels i (vector-ref grid-row-labels i)))
 
         ;; Load presets for all tracks
         (do ((i 0 (+ i 1))) ((>= i GRID_ROWS))
@@ -522,131 +666,140 @@ void gui_set_daw_theme(void) {
               (let* ((W (exact->inexact (gui-get-width)))
                      (H (exact->inexact (gui-get-height)))
                      (S (gui-get-dpi-scale))
-                     ;; Scaled row heights
+                     ;; Scaled sizes
                      (row-h  (* 25.0 S))
                      (row-sm (* 20.0 S))
                      (row-lg (* 30.0 S))
-                     ;; Layout regions
-                     (transport-h (* 55.0 S))
-                     (mid-h (* 0.4 (- H transport-h)))   ;; 40% for seq+synth
-                     (mixer-h (- H transport-h mid-h))    ;; rest for mixer
-                     (mid-y transport-h)
-                     (mixer-y (+ transport-h mid-h))
-                     (half-w (* 0.5 W))
-                     ;; Grid cell sizes scale with available space
-                     (grid-cell-w (max 20 (inexact->exact (round (/ (- half-w (* 40.0 S)) 16.0)))))
-                     (grid-cell-h (max 16 (inexact->exact (round (/ (- mid-h (* 60.0 S)) 8.0))))))
+                     (pad    (* 4.0 S))
+                     ;; Layout: toolbar | sequencer+sounds | mixer
+                     (toolbar-h (* 50.0 S))
+                     (mixer-h   (* 0.28 (- H toolbar-h)))
+                     (seq-h     (- H toolbar-h mixer-h))
+                     (seq-y     toolbar-h)
+                     (mixer-y   (+ toolbar-h seq-h))
+                     ;; Sequencer takes 65% width, sounds 35%
+                     (seq-w     (* 0.65 W))
+                     (sounds-w  (* 0.35 W))
+                     ;; Grid cells
+                     (label-w   (* 70.0 S))
+                     (grid-cell-w (max 16 (inexact->exact
+                                    (round (/ (- seq-w label-w (* 50.0 S)) 16.0)))))
+                     (grid-cell-h (max 14 (inexact->exact
+                                    (round (/ (- seq-h (* 80.0 S)) 8.0))))))
 
-              ;; Transport bar
-              (when (gui-begin-panel "Transport" 0.0 0.0 W transport-h 8)
-                (gui-row-dynamic row-lg 8)
-                (gui-label "Audio DAC")
-                (set! bpm (gui-property-float "#BPM" 40.0
-                            (exact->inexact bpm) 300.0 1.0 0.5))
-                (when (= (gui-button (if playing? "STOP" "PLAY")) 1)
+              ;; ==== TOOLBAR ====
+              (when (gui-begin-panel "##Toolbar" 0.0 0.0 W toolbar-h 8)
+                (gui-row-dynamic row-lg 10)
+                ;; File operations
+                (when (= (gui-button "Save") 1)
+                  (save-project! "project.daw" grid bpm track-presets track-volumes))
+                (when (= (gui-button "Load") 1)
+                  (load-project! "project.daw" grid track-presets track-volumes backend)
+                  (when *loaded-bpm* (set! bpm *loaded-bpm*) (set! *loaded-bpm* #f)))
+                ;; Separator
+                (gui-label "|")
+                ;; Transport
+                (when (= (gui-button (if playing? "Stop" "Play")) 1)
                   (set! playing? (not playing?))
                   (when (not playing?)
-                    ;; All notes off when stopping
                     (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
                       (backend-send backend CMD_ALL_NOTES_OFF r 0 0 0.0))
                     (set! current-step 0)))
-                (gui-label (string-append "Step: "
-                             (number->string (+ current-step 1))
-                             "/16"))
+                (set! bpm (gui-property-float "#BPM" 40.0
+                            (exact->inexact bpm) 300.0 1.0 0.5))
+                (gui-label (string-append "Step " (number->string (+ current-step 1)) "/16"))
                 (if playing?
                     (gui-label-colored "PLAYING" 50 200 80)
-                    (gui-label "STOPPED"))
+                    (gui-label-colored "STOPPED" 140 140 140))
+                ;; Spacers
                 (gui-label "")
                 (gui-label "")
-                (gui-label "")
+                (gui-label-colored "Audio DAC" 100 160 220)
                 (gui-end-panel))
 
-              ;; Sequencer grid
-              (when (gui-begin-panel "Sequencer" 0.0 mid-y half-w mid-h 8)
-                ;; Row labels
-                (gui-row-dynamic (* 15.0 S) 1)
-                (gui-label "Click cells to toggle notes. Rows = tracks, Cols = steps")
-                ;; Grid
-                (gui-sequencer-grid-raw grid GRID_ROWS GRID_COLS
-                  (if playing? current-step -1) grid-cell-w grid-cell-h)
+              ;; ==== SEQUENCER (with track labels) ====
+              (when (gui-begin-panel "Sequencer" 0.0 seq-y seq-w seq-h 8)
+                ;; Use the labeled grid
+                (gui-sequencer-grid-labeled-raw
+                  grid GRID_ROWS GRID_COLS
+                  (if playing? current-step -1)
+                  grid-cell-w grid-cell-h
+                  c-row-labels S)
                 (gui-end-panel))
 
-              ;; Synth editor - preset selector per track
-              (when (gui-begin-panel "Sounds" half-w mid-y half-w mid-h 8)
-                (gui-row-dynamic (* 18.0 S) 1)
-                (gui-label "Track Presets (click to change)")
-
-                ;; For each track row, show label + preset buttons
+              ;; ==== SOUNDS PANEL ====
+              (when (gui-begin-panel "Sounds" seq-w seq-y sounds-w seq-h 8)
+                ;; Track preset selectors
                 (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                  (gui-row-dynamic row-h 5)
-                  (gui-label-colored (vector-ref grid-row-labels r) 80 180 220)
-                  ;; Show 4 preset options relevant to this row
-                  (let* ((is-drum (>= r 4))
-                         ;; Preset groups: melodic or drum
-                         (presets-for-row
-                          (if is-drum
+                  ;; Track header
+                  (gui-row-dynamic (* 16.0 S) 2)
+                  (gui-label-colored
+                    (string-append (number->string (+ r 1)) ". "
+                      (vector-ref grid-row-labels r))
+                    (if (< r 4) 80 220) (if (< r 4) 180 160) (if (< r 4) 220 80))
+                  (gui-label-colored
+                    (vector-ref preset-names (vector-ref track-presets r))
+                    160 200 160)
+                  ;; Preset buttons
+                  (let* ((presets-for-row
+                          (if (>= r 4)
                               (case r
-                                ((4) #(6 1 2 13))   ;; kick row: 808 Kick, Sub, Acid, Reese
-                                ((5) #(7 10 12 11)) ;; snare row: Snare, Clap, Stab, Pluck
-                                ((6) #(8 9 10 4))   ;; hh-c: HH-C, HH-O, Clap, Bell
-                                ((7) #(9 8 4 5))    ;; hh-o: HH-O, HH-C, Bell, EPiano
+                                ((4) #(6 1 2 13))
+                                ((5) #(7 10 12 11))
+                                ((6) #(8 9 10 4))
+                                ((7) #(9 8 4 5))
                                 (else #(6 7 8 9)))
                               (case r
-                                ((0) #(0 15 11 12))  ;; lead: Supersaw, Brass, Pluck, Stab
-                                ((1) #(13 1 2 14))   ;; bass: Reese, Sub, Acid, Strings
-                                ((2) #(11 4 5 12))   ;; pluck: Pluck, Bell, EPiano, Stab
-                                ((3) #(3 14 5 4))    ;; pad: Pad, Strings, EPiano, Bell
+                                ((0) #(0 15 11 12))
+                                ((1) #(13 1 2 14))
+                                ((2) #(11 4 5 12))
+                                ((3) #(3 14 5 4))
                                 (else #(0 1 2 3))))))
+                    (gui-row-dynamic (* 22.0 S) 4)
                     (do ((p 0 (+ p 1))) ((>= p 4))
-                      (let* ((preset-idx (vector-ref presets-for-row p))
-                             (pname (vector-ref preset-names preset-idx))
-                             (is-active (= (vector-ref track-presets r) preset-idx))
-                             (label (if is-active
-                                        (string-append "[" pname "]")
-                                        pname)))
-                        (when (= (gui-button label) 1)
-                          (vector-set! track-presets r preset-idx)
-                          (backend-send backend CMD_LOAD_PRESET r preset-idx 0 0.0))))))
+                      (let* ((pi (vector-ref presets-for-row p))
+                             (pn (vector-ref preset-names pi))
+                             (act (= (vector-ref track-presets r) pi)))
+                        (when (= (gui-button (if act (string-append ">" pn) pn)) 1)
+                          (vector-set! track-presets r pi)
+                          (backend-send backend CMD_LOAD_PRESET r pi 0 0.0))))))
 
-                ;; Filter control for selected track
-                (gui-row-dynamic (* 12.0 S) 1)
-                (gui-label "-- Master Filter (Track 0) --")
+                ;; Filter at bottom
+                (gui-separator (* 5.0 S))
+                (gui-row-dynamic (* 14.0 S) 1)
+                (gui-label-colored "Filter" 120 160 200)
                 (let ((new-cutoff (gui-slider "Cutoff"
                                     (exact->inexact cutoff) 20.0 20000.0 10.0)))
                   (when (not (= new-cutoff cutoff))
                     (set! cutoff new-cutoff)
                     (backend-send backend CMD_SET_FILTER 0 0 0 cutoff)))
-                (let ((new-reso (gui-slider "Resonance"
-                                  (exact->inexact resonance) 0.0 0.99 0.01)))
+                (let ((new-reso (gui-slider "Reso"
+                                  (exact->inexact resonance) 0.0 0.95 0.01)))
                   (when (not (= new-reso resonance))
                     (set! resonance new-reso)
                     (backend-send backend CMD_SET_FILTER 0 1 0 resonance)))
-
                 (gui-end-panel))
 
-              ;; Mixer - each track as a vertical strip: [M][S] Name Vol
+              ;; ==== MIXER ====
               (when (gui-begin-panel "Mixer" 0.0 mixer-y W mixer-h 8)
-                ;; Per-track rows: M/S buttons on left, then name, then volume
                 (do ((i 0 (+ i 1))) ((>= i 8))
-                  (gui-row-dynamic row-h 5)
-                  ;; Mute button (left)
+                  (gui-row-dynamic row-h 6)
+                  ;; Mute
                   (let ((m (vector-ref track-mutes i)))
-                    (when (= (gui-button (if m "M!" "M")) 1)
+                    (when (= (gui-button (if m "M!" "M ")) 1)
                       (vector-set! track-mutes i (not m))
-                      (backend-send backend CMD_MUTE_TRACK i
-                        (if (not m) 1 0) 0 0.0)))
-                  ;; Solo button
+                      (backend-send backend CMD_MUTE_TRACK i (if (not m) 1 0) 0 0.0)))
+                  ;; Solo
                   (let ((s (vector-ref track-solos i)))
-                    (when (= (gui-button (if s "S!" "S")) 1)
+                    (when (= (gui-button (if s "S!" "S ")) 1)
                       (vector-set! track-solos i (not s))
-                      (backend-send backend CMD_SOLO_TRACK i
-                        (if (not s) 1 0) 0 0.0)))
-                  ;; Track label with preset name
+                      (backend-send backend CMD_SOLO_TRACK i (if (not s) 1 0) 0 0.0)))
+                  ;; Track name + preset
                   (gui-label-colored
                     (string-append (vector-ref grid-row-labels i) " - "
                       (vector-ref preset-names (vector-ref track-presets i)))
-                    180 200 220)
-                  ;; Volume slider (takes 2 columns)
+                    (if (< i 4) 80 220) (if (< i 4) 180 160) (if (< i 4) 220 80))
+                  ;; Volume
                   (let* ((vol (vector-ref track-volumes i))
                          (new-vol (gui-slider ""
                                     (exact->inexact vol) 0.0 1.0 0.01)))
@@ -654,7 +807,6 @@ void gui_set_daw_theme(void) {
                       (vector-set! track-volumes i new-vol)
                       (backend-send backend CMD_SET_VOLUME i 0 0
                         (exact->inexact new-vol)))))
-
                 (gui-end-panel))
 
               ) ;; end let* for layout dimensions
@@ -664,6 +816,7 @@ void gui_set_daw_theme(void) {
               (loop)))))) ;; loop, unless, let-quit, let-loop, let-track-presets
 
         ;; Cleanup
+        (row-labels-free c-row-labels)
         (grid-free grid)
         (backend-stop backend)
         (gui-shutdown)
