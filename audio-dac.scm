@@ -326,6 +326,12 @@ void gui_separator(float height) {
     nk_layout_row_dynamic(g_ctx, height, 1);
     nk_label(g_ctx, \"\", NK_TEXT_LEFT);
 }
+
+/* Inline slider - no layout row, fits inside existing row */
+float gui_slider_inline(float val, float mn, float mx, float step) {
+    nk_slider_float(g_ctx, mn, &val, mx, step);
+    return val;
+}
 ")
 
 ;; ---- FFI Bindings ----
@@ -364,6 +370,7 @@ void gui_separator(float height) {
 (define gui-get-height (foreign-lambda int "gui_get_height"))
 (define gui-get-dpi-scale (foreign-lambda float "gui_get_dpi_scale"))
 (define gui-separator (foreign-lambda void "gui_separator" float))
+(define gui-slider-inline (foreign-lambda float "gui_slider_inline" float float float float))
 
 ;; Labeled grid FFI - needs C string array
 (define gui-sequencer-grid-labeled-raw
@@ -795,7 +802,7 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
               ;; ==== MIXER ====
               (when (gui-begin-panel "Mixer" 0.0 mixer-y W mixer-h 8)
                 (do ((i 0 (+ i 1))) ((>= i 8))
-                  (gui-row-dynamic row-h 6)
+                  (gui-row-dynamic row-h 7)
                   ;; Mute
                   (let ((m (vector-ref track-mutes i)))
                     (when (= (gui-button (if m "M!" "M ")) 1)
@@ -811,14 +818,18 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                     (string-append (vector-ref grid-row-labels i) " - "
                       (vector-ref preset-names (vector-ref track-presets i)))
                     (if (< i 4) 80 220) (if (< i 4) 180 160) (if (< i 4) 220 80))
-                  ;; Volume
+                  ;; Volume (inline slider, no layout row)
                   (let* ((vol (vector-ref track-volumes i))
-                         (new-vol (gui-slider ""
+                         (new-vol (gui-slider-inline
                                     (exact->inexact vol) 0.0 1.0 0.01)))
                     (when (not (= new-vol vol))
                       (vector-set! track-volumes i new-vol)
                       (backend-send backend CMD_SET_VOLUME i 0 0
-                        (exact->inexact new-vol)))))
+                        (exact->inexact new-vol))))
+                  ;; Volume label
+                  (gui-label (string-append
+                    (number->string (inexact->exact (round (* (vector-ref track-volumes i) 100.0))))
+                    "%")))
                 (gui-end-panel))
 
               ) ;; end let* for layout dimensions
