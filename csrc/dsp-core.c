@@ -277,6 +277,20 @@ void voice_note_on(Voice *v, int note, float velocity, float sample_rate,
                   sample_rate);
     v->filter_env_amount = track->default_filt_env_amount;
     envelope_gate_on(&v->filter_env);
+
+    /* Per-voice pitch envelope */
+    v->pitch_env_amount = track->default_pitch_env_amount;
+    v->pitch_env_level = (track->default_pitch_env_amount != 0.0f) ? 1.0f : 0.0f;
+    v->pitch_env_rate = (track->default_pitch_env_decay > 0.001f)
+        ? 1.0f / (track->default_pitch_env_decay * sample_rate) : 1.0f;
+
+    /* Per-voice FM phase */
+    v->fm_mod_phase = 0.0f;
+
+    /* Anti-click: ~2ms fade-in */
+    v->fade_in = 0.0f;
+    v->fade_in_samples = (int)(0.002f * sample_rate);
+    if (v->fade_in_samples < 1) v->fade_in_samples = 1;
 }
 
 void voice_note_off(Voice *v) {
@@ -291,80 +305,73 @@ void voice_render_internal(Voice *v, float *left, float *right, int frames,
     float mono_buf[BLOCK_SIZE];
     int use_exp = track->default_exp_envelope;
     int synth_type = track->synth_type;
-
-    /* Pitch envelope state */
-    float pitch_env_amount = track->default_pitch_env_amount;
-    float pitch_env_decay = track->default_pitch_env_decay;
-    float pitch_env_level = (pitch_env_amount != 0.0f) ? 1.0f : 0.0f;
-    float pitch_env_rate = (pitch_env_decay > 0.001f)
-        ? 1.0f / (pitch_env_decay * sample_rate) : 1.0f;
-
-    /* FM synthesis parameters */
     float fm_ratio = track->default_fm_ratio;
     float fm_index = track->default_fm_index;
 
+    /* Precompute inverse sample rate */
+    float inv_sr = 1.0f / sample_rate;
+
     for (int i = 0; i < frames; i++) {
         float osc_out = 0.0f;
-        float total_mix = 0.0f;
 
-        /* Apply pitch envelope (decays from pitch_env_amount to 0 semitones) */
-        if (pitch_env_amount != 0.0f && pitch_env_level > 0.001f) {
-            float pitch_shift = pitch_env_amount * pitch_env_level;
+        /* Apply pitch envelope (per-voice, persistent state) */
+        if (v->pitch_env_amount != 0.0f && v->pitch_env_level > 0.0001f) {
+            float pitch_shift = v->pitch_env_amount * v->pitch_env_level;
             float pitch_mult = powf(2.0f, pitch_shift / 12.0f);
-            /* Temporarily adjust osc[0] phase_inc */
-            float base_freq = v->osc[0].frequency;
-            v->osc[0].phase_inc = (base_freq * pitch_mult) / sample_rate;
-            pitch_env_level -= pitch_env_rate;
-            if (pitch_env_level < 0.0f) pitch_env_level = 0.0f;
+            v->osc[0].phase_inc = v->osc[0].frequency * pitch_mult * inv_sr;
+            /* Exponential decay for natural pitch drop */
+            v->pitch_env_level *= (1.0f - v->pitch_env_rate);
+            if (v->pitch_env_level < 0.0001f) v->pitch_env_level = 0.0f;
         }
 
         if (synth_type == 1 && fm_ratio > 0.0f && fm_index > 0.0f) {
-            /* FM synthesis: osc[0] is carrier, modulator is generated inline */
+            /* FM synthesis with per-voice modulator phase */
             float mod_freq = v->osc[0].frequency * fm_ratio;
-            static float fm_mod_phase = 0.0f; /* simple static - OK for now */
-            float mod_out = sinf(TWO_PI * fm_mod_phase) * fm_index;
-            fm_mod_phase += mod_freq / sample_rate;
-            if (fm_mod_phase >= 1.0f) fm_mod_phase -= 1.0f;
+            float mod_out = sinf(TWO_PI * v->fm_mod_phase) * fm_index;
+            v->fm_mod_phase += mod_freq * inv_sr;
+            while (v->fm_mod_phase >= 1.0f) v->fm_mod_phase -= 1.0f;
 
-            /* Modulate carrier phase */
             float carrier_phase = v->osc[0].phase + mod_out;
             osc_out = sinf(TWO_PI * carrier_phase);
             v->osc[0].phase += v->osc[0].phase_inc;
-            if (v->osc[0].phase >= 1.0f) v->osc[0].phase -= 1.0f;
-            total_mix = 1.0f;
+            while (v->osc[0].phase >= 1.0f) v->osc[0].phase -= 1.0f;
         } else {
-            /* Additive: mix all oscillators with their mix levels */
+            /* Additive: mix all oscillators */
+            float total_mix = 0.0f;
             for (int o = 0; o < v->osc_count; o++) {
-                float s = osc_process_sample(&v->osc[o]);
-                osc_out += s * v->osc[o].mix_level;
+                osc_out += osc_process_sample(&v->osc[o]) * v->osc[o].mix_level;
                 total_mix += v->osc[o].mix_level;
             }
-            /* Normalize by total mix to prevent clipping */
-            if (total_mix > 1.0f) {
-                osc_out /= total_mix;
-            }
+            if (total_mix > 1.0f) osc_out /= total_mix;
         }
 
         mono_buf[i] = osc_out;
     }
 
-    /* Apply filter with envelope modulation (per-sample for accuracy) */
+    /* Apply filter with envelope modulation */
     float base_cutoff = v->filter.cutoff;
-    float fc_min = 20.0f, fc_max = clampf(sample_rate * 0.45f, 20.0f, 20000.0f);
+    /* Stability limit for state-variable filter: f must be < 1.0 */
+    float max_stable_fc = sample_rate * 0.43f;
 
     for (int i = 0; i < frames; i++) {
         float filt_env = use_exp ? envelope_process_sample_exp(&v->filter_env)
                                  : envelope_process_sample(&v->filter_env);
         float fc = base_cutoff + v->filter_env_amount * filt_env;
-        v->filter.cutoff = clampf(fc, fc_min, fc_max);
+        fc = clampf(fc, 20.0f, max_stable_fc);
 
-        /* Inline single-sample filter for per-sample cutoff modulation */
-        float f = 2.0f * sinf((float)M_PI * v->filter.cutoff / sample_rate);
-        float q = 1.0f - clampf(v->filter.resonance, 0.0f, 0.99f);
+        /* Filter coefficient clamped to prevent instability */
+        float f = 2.0f * sinf((float)M_PI * fc * inv_sr);
+        if (f > 0.95f) f = 0.95f;  /* stability clamp */
+        float q = 1.0f - clampf(v->filter.resonance, 0.0f, 0.95f);
+
         float input = mono_buf[i];
         v->filter.low  += f * v->filter.band;
         v->filter.high  = input - v->filter.low - q * v->filter.band;
         v->filter.band += f * v->filter.high;
+
+        /* Clamp filter state to prevent runaway values */
+        v->filter.low  = clampf(v->filter.low, -10.0f, 10.0f);
+        v->filter.band = clampf(v->filter.band, -10.0f, 10.0f);
 
         switch (v->filter.type) {
             case FILTER_LP: mono_buf[i] = v->filter.low;  break;
@@ -374,14 +381,26 @@ void voice_render_internal(Voice *v, float *left, float *right, int frames,
     }
     v->filter.cutoff = base_cutoff;
 
-    /* Apply amp envelope and pan, mix into output */
+    /* Apply amp envelope, fade-in, and pan */
     float pan_r = (v->pan + 1.0f) * 0.5f;
     float pan_l = 1.0f - pan_r;
 
     for (int i = 0; i < frames; i++) {
         float amp = use_exp ? envelope_process_sample_exp(&v->amp_env)
                             : envelope_process_sample(&v->amp_env);
+
+        /* Anti-click fade-in (~2ms) */
+        if (v->fade_in < 1.0f) {
+            v->fade_in += 1.0f / (float)v->fade_in_samples;
+            if (v->fade_in > 1.0f) v->fade_in = 1.0f;
+            amp *= v->fade_in;
+        }
+
         float sample = mono_buf[i] * amp * v->velocity;
+
+        /* Final soft clamp to prevent clicks from filter overshoot */
+        if (sample > 1.0f) sample = 1.0f;
+        else if (sample < -1.0f) sample = -1.0f;
 
         left[i]  += sample * pan_l;
         right[i] += sample * pan_r;
@@ -499,7 +518,7 @@ static Voice* find_free_voice(Track *t) {
             return &t->voices[i];
         }
     }
-    /* Voice stealing: find oldest voice */
+    /* Voice stealing: find oldest voice and force it off cleanly */
     uint32_t min_age = UINT32_MAX;
     int oldest = 0;
     for (int i = 0; i < MAX_VOICES; i++) {
@@ -508,6 +527,10 @@ static Voice* find_free_voice(Track *t) {
             oldest = i;
         }
     }
+    /* Zero the stolen voice's amplitude to prevent click */
+    t->voices[oldest].amp_env.level = 0.0f;
+    t->voices[oldest].amp_env.stage = ENV_IDLE;
+    t->voices[oldest].active = 0;
     return &t->voices[oldest];
 }
 
@@ -580,9 +603,12 @@ void engine_render(AudioEngine *engine, float *output, int frames) {
         }
     }
 
-    /* Apply master volume and clamp */
+    /* Apply master volume with soft clipping (tanh) to prevent pops */
     for (int i = 0; i < frames * 2; i++) {
         output[i] *= engine->master_volume;
-        output[i] = clampf(output[i], -1.0f, 1.0f);
+        /* Soft clip: tanh saturates smoothly instead of hard clipping */
+        if (output[i] > 0.8f || output[i] < -0.8f) {
+            output[i] = tanhf(output[i]);
+        }
     }
 }

@@ -76,6 +76,15 @@ typedef struct {
     int        active;
     int        note;               /* MIDI note number */
     uint32_t   age;                /* for voice stealing: incremented each note-on */
+    /* Per-voice pitch envelope state */
+    float      pitch_env_level;    /* current pitch env level (1.0 -> 0.0) */
+    float      pitch_env_rate;     /* decay rate per sample */
+    float      pitch_env_amount;   /* semitones of pitch sweep */
+    /* Per-voice FM modulator phase */
+    float      fm_mod_phase;
+    /* Anti-click fade-in */
+    float      fade_in;            /* 0.0 -> 1.0 over ~2ms */
+    int        fade_in_samples;
 } Voice;
 
 typedef struct {
