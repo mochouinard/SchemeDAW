@@ -531,6 +531,12 @@ float gui_slider_inline(float val, float mn, float mx, float step) {
     "for (int i = 0; i < count; i++) free((void*)((const char **)arr)[i]);
      free(arr);"))
 
+;; Sample loading (from Scheme thread, not audio callback)
+(define backend-load-sample
+  (foreign-lambda int "backend_load_sample" c-pointer c-string int))
+(define backend-set-master-volume
+  (foreign-lambda void "backend_set_master_volume" c-pointer float))
+
 ;; SDL delay and timing
 (foreign-declare "
 void c_delay_ms(int ms) { SDL_Delay(ms); }
@@ -563,6 +569,10 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
 (define WAVE_SINE 0) (define WAVE_SAW 1)
 (define WAVE_SQUARE 2) (define WAVE_TRIANGLE 3) (define WAVE_NOISE 4)
 
+(define CMD_SAMPLE_TRIGGER #x21)
+(define CMD_SAMPLE_STOP    #x22)
+(define CMD_MASTER_VOL     #x23)
+(define CMD_TRACK_FX       #x24)
 (define CMD_SET_OSC_COUNT  #x0F)
 (define CMD_SET_OSC2       #x10)
 (define CMD_SET_OSC3       #x11)
@@ -728,6 +738,8 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
             (arrangement-length 4)  ;; default: 4 slots
             (arrangement-pos 0)     ;; current position in arrangement
             (arrangement-mode #f)   ;; #f = pattern loop, #t = song mode
+            ;; Master volume
+            (master-vol 0.8)
             ;; Per-track FX settings
             (track-delay (make-vector 8 0.0))    ;; delay mix 0-1
             (track-reverb (make-vector 8 0.0))   ;; reverb mix 0-1
@@ -906,17 +918,16 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                 (gui-label "")
                 (gui-end-panel))
 
-              ;; ==== SOUNDS PANEL ====
-              (when (gui-begin-panel "Sounds" seq-w seq-y sounds-w seq-h 8)
-                ;; Track preset selectors with note control
+              ;; ==== SOUNDS / SYNTH EDITOR PANEL ====
+              (when (gui-begin-panel "Sounds" seq-w seq-y sounds-w seq-h 0)
+                ;; -- Track selector with note + preset --
                 (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                  ;; Track header: name, note, -oct, -1, +1, +oct
-                  (gui-row-dynamic (* 18.0 S) 6)
+                  ;; Track header: name, note, +/- controls
+                  (gui-row-dynamic (* 16.0 S) 6)
                   (gui-label-colored
                     (string-append (number->string (+ r 1)) ". "
                       (vector-ref grid-row-labels r))
                     (if (< r 4) 80 220) (if (< r 4) 180 160) (if (< r 4) 220 80))
-                  ;; Current note display
                   (gui-label-colored
                     (note-name (vector-ref grid-row-notes r))
                     200 220 160)
@@ -959,7 +970,7 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                                 ((2) #(11 4 5 12))
                                 ((3) #(3 14 5 4))
                                 (else #(0 1 2 3))))))
-                    (gui-row-dynamic (* 22.0 S) 4)
+                    (gui-row-dynamic (* 20.0 S) 4)
                     (do ((p 0 (+ p 1))) ((>= p 4))
                       (let* ((pi (vector-ref presets-for-row p))
                              (pn (vector-ref preset-names pi))
@@ -968,15 +979,14 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                           (vector-set! track-presets r pi)
                           (backend-send backend CMD_LOAD_PRESET r pi 0 0.0))))))
 
-                ;; Filter
-                (gui-separator (* 3.0 S))
+                ;; -- Global Filter --
+                (gui-separator (* 2.0 S))
                 (gui-row-dynamic (* 14.0 S) 1)
-                (gui-label-colored "Global Filter" 120 160 200)
+                (gui-label-colored "Global Filter" 100 150 200)
                 (let ((new-cutoff (gui-slider "Cutoff"
                                     (exact->inexact cutoff) 20.0 20000.0 10.0)))
                   (when (not (= new-cutoff cutoff))
                     (set! cutoff new-cutoff)
-                    ;; Apply to all tracks
                     (do ((t 0 (+ t 1))) ((>= t GRID_ROWS))
                       (backend-send backend CMD_SET_FILTER t 0 0 cutoff))))
                 (let ((new-reso (gui-slider "Reso"
@@ -985,6 +995,37 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                     (set! resonance new-reso)
                     (do ((t 0 (+ t 1))) ((>= t GRID_ROWS))
                       (backend-send backend CMD_SET_FILTER t 1 0 resonance))))
+
+                ;; -- Master Volume --
+                (gui-separator (* 2.0 S))
+                (gui-row-dynamic (* 14.0 S) 1)
+                (gui-label-colored "Master" 100 150 200)
+                (let ((new-master (gui-slider "Volume"
+                                    (exact->inexact master-vol) 0.0 1.0 0.01)))
+                  (when (not (= new-master master-vol))
+                    (set! master-vol new-master)
+                    (backend-set-master-volume backend (exact->inexact master-vol))))
+
+                ;; -- Sample Browser --
+                (gui-separator (* 2.0 S))
+                (gui-row-dynamic (* 14.0 S) 1)
+                (gui-label-colored "Sample Loader" 100 150 200)
+                (gui-row-dynamic row-sm 3)
+                (gui-label "samples/drums/")
+                (when (= (gui-button "Load kick.wav") 1)
+                  (let ((r (backend-load-sample backend "samples/drums/kick.wav" 0)))
+                    (when (>= r 0) (format #t "Loaded kick.wav into slot 0~%"))))
+                (when (= (gui-button "Load snare.wav") 1)
+                  (let ((r (backend-load-sample backend "samples/drums/snare.wav" 1)))
+                    (when (>= r 0) (format #t "Loaded snare.wav into slot 1~%"))))
+                (gui-row-dynamic row-sm 3)
+                (when (= (gui-button "Trigger S0") 1)
+                  (backend-send backend CMD_SAMPLE_TRIGGER 0 100 0 1.0))
+                (when (= (gui-button "Trigger S1") 1)
+                  (backend-send backend CMD_SAMPLE_TRIGGER 1 100 0 1.0))
+                (when (= (gui-button "Stop All") 1)
+                  (backend-send backend CMD_SAMPLE_STOP 255 0 0 0.0))
+
                 (gui-end-panel))
 
               ;; ==== ARRANGEMENT (Song Timeline) ====

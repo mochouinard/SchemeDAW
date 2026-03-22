@@ -603,12 +603,5 @@ void engine_render(AudioEngine *engine, float *output, int frames) {
         }
     }
 
-    /* Apply master volume with soft clipping (tanh) to prevent pops */
-    for (int i = 0; i < frames * 2; i++) {
-        output[i] *= engine->master_volume;
-        /* Soft clip: tanh saturates smoothly instead of hard clipping */
-        if (output[i] > 0.8f || output[i] < -0.8f) {
-            output[i] = tanhf(output[i]);
-        }
-    }
+    /* Note: master volume and soft clipping now handled in audio_callback */
 }

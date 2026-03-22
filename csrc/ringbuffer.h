@@ -27,6 +27,10 @@
 #define CMD_SET_SYNTH_TYPE 0x14
 #define CMD_SET_EXP_ENV   0x15  /* param1: 0=linear, 1=exponential */
 #define CMD_LOAD_PRESET   0x20  /* param1: preset index */
+#define CMD_SAMPLE_TRIGGER 0x21 /* track=slot, param1=vel, fvalue=pitch */
+#define CMD_SAMPLE_STOP   0x22  /* track=slot */
+#define CMD_MASTER_VOL    0x23  /* fvalue=volume */
+#define CMD_TRACK_FX      0x24  /* track, param1=fx(0=del,1=rev,2=dist), fvalue=mix */
 
 /* Fixed-size command message */
 typedef struct {

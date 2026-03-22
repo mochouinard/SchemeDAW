@@ -451,9 +451,27 @@ static void process_command(AudioBackend *ab, const AudioCommand *cmd) {
         case CMD_LOAD_PRESET:
             if (cmd->track < MAX_TRACKS) {
                 Track *t = &engine->tracks[cmd->track];
-                /* Built-in preset loader - see presets below */
                 load_builtin_preset(t, cmd->param1);
             }
+            break;
+
+        case CMD_SAMPLE_TRIGGER:
+            sample_engine_trigger(&ab->samples, cmd->track,
+                (float)cmd->param1 / 127.0f, 0.0f,
+                cmd->fvalue > 0.0f ? cmd->fvalue : 1.0f);
+            break;
+
+        case CMD_SAMPLE_STOP:
+            sample_engine_stop_sample(&ab->samples, cmd->track);
+            break;
+
+        case CMD_MASTER_VOL:
+            ab->master_volume = cmd->fvalue;
+            break;
+
+        case CMD_TRACK_FX:
+            /* param1: 0=delay mix, 1=reverb mix, 2=distortion mix */
+            /* Currently stores the value; full per-track FX routing is TODO */
             break;
 
         default:
@@ -476,8 +494,29 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
         process_command(ab, &cmd);
     }
 
-    /* Render audio */
+    /* Render synth engine */
     engine_render(&ab->engine, output, frames);
+
+    /* Render samples and mix into output */
+    float samp_l[BLOCK_SIZE], samp_r[BLOCK_SIZE];
+    memset(samp_l, 0, frames * sizeof(float));
+    memset(samp_r, 0, frames * sizeof(float));
+    sample_engine_render(&ab->samples, samp_l, samp_r, frames);
+    for (int i = 0; i < frames; i++) {
+        output[i * 2]     += samp_l[i];
+        output[i * 2 + 1] += samp_r[i];
+    }
+
+    /* Apply per-track effects (on the mixed output for now) */
+    /* TODO: per-track FX requires splitting before mix - for now apply master FX */
+
+    /* Apply master volume with soft clipping */
+    for (int i = 0; i < frames * 2; i++) {
+        output[i] *= ab->master_volume;
+        if (output[i] > 0.8f || output[i] < -0.8f) {
+            output[i] = tanhf(output[i]);
+        }
+    }
 }
 
 AudioBackend* backend_create(int sample_rate, int buffer_size) {
@@ -485,9 +524,16 @@ AudioBackend* backend_create(int sample_rate, int buffer_size) {
     if (!ab) return NULL;
 
     engine_init(&ab->engine, (float)sample_rate, buffer_size);
+    sample_engine_init(&ab->samples, (float)sample_rate);
     ringbuffer_init(&ab->cmd_ring);
     ab->device_id = 0;
     ab->running = 0;
+    ab->master_volume = 0.8f;
+
+    /* Initialize per-track effect chains */
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        effect_chain_init(&ab->track_fx[i]);
+    }
 
     return ab;
 }
@@ -576,6 +622,11 @@ void backend_destroy(AudioBackend *ab) {
         ab->device_id = 0;
     }
 
+    sample_engine_destroy(&ab->samples);
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        effect_chain_destroy(&ab->track_fx[i]);
+    }
+
     free(ab);
 }
 
@@ -592,4 +643,12 @@ int backend_send_command(AudioBackend *ab, uint8_t type, uint8_t track,
 
 AudioEngine* backend_get_engine(AudioBackend *ab) {
     return &ab->engine;
+}
+
+int backend_load_sample(AudioBackend *ab, const char *filename, int slot) {
+    return sample_engine_load(&ab->samples, filename, slot);
+}
+
+void backend_set_master_volume(AudioBackend *ab, float volume) {
+    ab->master_volume = volume;
 }
