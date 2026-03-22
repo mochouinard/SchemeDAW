@@ -438,16 +438,20 @@ void gui_separator(float height) {
 
 (define row-labels-set!
   (foreign-lambda* void ((c-pointer arr) (int idx) (c-string str))
-    "((const char **)arr)[idx] = str;"))
+    "((const char **)arr)[idx] = strdup(str);"))
 
 (define row-labels-free
-  (foreign-lambda* void ((c-pointer arr))
-    "free(arr);"
-    ))
+  (foreign-lambda* void ((c-pointer arr) (int count))
+    "for (int i = 0; i < count; i++) free((void*)((const char **)arr)[i]);
+     free(arr);"))
 
-;; SDL delay for timing
-(foreign-declare "void c_delay_ms(int ms) { SDL_Delay(ms); }")
+;; SDL delay and timing
+(foreign-declare "
+void c_delay_ms(int ms) { SDL_Delay(ms); }
+unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
+")
 (define c-delay-ms (foreign-lambda void "c_delay_ms" int))
+(define c-get-ticks (foreign-lambda unsigned-integer32 "c_get_ticks"))
 (define (thread-sleep! seconds)
   (c-delay-ms (inexact->exact (round (* seconds 1000.0)))))
 
@@ -612,7 +616,7 @@ void gui_separator(float height) {
             (cutoff 4000.0)
             (resonance 0.3)
             (current-step 0)
-            (step-timer 0)
+            (last-step-time (c-get-ticks))
             (track-volumes (make-vector 8 0.8))
             (track-mutes (make-vector 8 #f))
             (track-solos (make-vector 8 #f)))
@@ -636,28 +640,32 @@ void gui_separator(float height) {
           (let ((quit? (gui-process-events!)))
             (unless quit?
 
-              ;; ---- Sequencer tick ----
+              ;; ---- Sequencer tick (time-based, works when unfocused) ----
               (when playing?
-                (set! step-timer (+ step-timer 1))
-                (let ((step-duration (inexact->exact
-                                      (round (/ (* 44100.0 60.0) (* bpm 4.0 60.0))))))
-                  ;; ~every N frames, advance step (approximation via frame count)
-                  (when (>= step-timer 8) ;; ~8 frames at vsync = ~133ms at 60fps
-                    (set! step-timer 0)
-                    ;; Note off previous step
-                    (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                      (let ((note (vector-ref grid-row-notes r))
-                            (prev-active (grid-get grid (+ (* r GRID_COLS) current-step))))
-                        (when (= prev-active 1)
-                          (backend-send backend CMD_NOTE_OFF r note 0 0.0))))
-                    ;; Advance step
-                    (set! current-step (modulo (+ current-step 1) GRID_COLS))
-                    ;; Note on current step
-                    (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                      (let ((note (vector-ref grid-row-notes r))
-                            (active (grid-get grid (+ (* r GRID_COLS) current-step))))
-                        (when (= active 1)
-                          (backend-send backend CMD_NOTE_ON r note 100 0.0)))))))
+                (let* ((now (c-get-ticks))
+                       ;; Step duration in ms: at 120 BPM, 16th note = 125ms
+                       (step-ms (inexact->exact (round (/ 60000.0 (* bpm 4.0)))))
+                       (elapsed (- now last-step-time)))
+                  ;; Advance as many steps as needed (catches up if window was throttled)
+                  (when (>= elapsed step-ms)
+                    (let advance-loop ((remaining elapsed))
+                      (when (>= remaining step-ms)
+                        ;; Note off previous step
+                        (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
+                          (let ((note (vector-ref grid-row-notes r))
+                                (prev-active (grid-get grid (+ (* r GRID_COLS) current-step))))
+                            (when (= prev-active 1)
+                              (backend-send backend CMD_NOTE_OFF r note 0 0.0))))
+                        ;; Advance step
+                        (set! current-step (modulo (+ current-step 1) GRID_COLS))
+                        ;; Note on current step
+                        (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
+                          (let ((note (vector-ref grid-row-notes r))
+                                (active (grid-get grid (+ (* r GRID_COLS) current-step))))
+                            (when (= active 1)
+                              (backend-send backend CMD_NOTE_ON r note 100 0.0))))
+                        (advance-loop (- remaining step-ms))))
+                    (set! last-step-time now))))
 
               ;; ---- Draw GUI ----
               (gui-frame-begin)
@@ -816,7 +824,7 @@ void gui_separator(float height) {
               (loop)))))) ;; loop, unless, let-quit, let-loop, let-track-presets
 
         ;; Cleanup
-        (row-labels-free c-row-labels)
+        (row-labels-free c-row-labels GRID_ROWS)
         (grid-free grid)
         (backend-stop backend)
         (gui-shutdown)
