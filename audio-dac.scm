@@ -67,6 +67,9 @@ void gui_meter(const char *label, float level);
 int gui_sequencer_grid(int *grid_data, int rows, int cols, int current_step,
                        int cell_width, int cell_height);
 void gui_set_daw_theme(void);
+int gui_get_width(void);
+int gui_get_height(void);
+float gui_get_dpi_scale(void);
 ")
 
 ;; Include gui-backend implementation with guard
@@ -77,27 +80,62 @@ static SDL_Renderer *g_renderer = NULL;
 static struct nk_context *g_ctx = NULL;
 static int g_width  = 1280;
 static int g_height = 800;
+static float g_dpi_scale = 1.0f;
+
+int gui_get_width(void) { return g_width; }
+int gui_get_height(void) { return g_height; }
+float gui_get_dpi_scale(void) { return g_dpi_scale; }
 
 int gui_init(int width, int height, const char *title) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, \"SDL_Init failed: %s\\n\", SDL_GetError());
         return -1;
     }
-    g_width = width; g_height = height;
+
+    /* Detect DPI scale: compare logical and pixel sizes */
+    /* SDL_WINDOW_ALLOW_HIGHDPI tells SDL to create a high-DPI drawable */
     g_window = SDL_CreateWindow(title,
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        width, height, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+        width, height,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!g_window) { fprintf(stderr, \"Window failed: %s\\n\", SDL_GetError()); return -1; }
+
+    /* Calculate DPI scale from display DPI */
+    float dpi = 0;
+    int display_idx = SDL_GetWindowDisplayIndex(g_window);
+    if (SDL_GetDisplayDPI(display_idx, &dpi, NULL, NULL) == 0 && dpi > 0) {
+        g_dpi_scale = dpi / 96.0f;  /* 96 DPI is the baseline */
+        if (g_dpi_scale < 1.0f) g_dpi_scale = 1.0f;
+    } else {
+        /* Fallback: check renderer output vs window size */
+        g_dpi_scale = 1.0f;
+    }
+    fprintf(stderr, \"DPI scale: %.2f\\n\", g_dpi_scale);
+
+    /* Get actual window size */
+    SDL_GetWindowSize(g_window, &g_width, &g_height);
+
     g_renderer = SDL_CreateRenderer(g_window, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!g_renderer) { SDL_DestroyWindow(g_window); return -1; }
+
     g_ctx = nk_sdl_init(g_window, g_renderer);
+
+    /* Load font scaled to DPI */
     { struct nk_font_atlas *atlas;
+      float font_size = 14.0f * g_dpi_scale;
+      if (font_size < 14.0f) font_size = 14.0f;
       nk_sdl_font_stash_begin(&atlas);
-      struct nk_font *font = nk_font_atlas_add_default(atlas, 14, NULL);
+      struct nk_font *font = nk_font_atlas_add_default(atlas, font_size, NULL);
       nk_sdl_font_stash_end();
       nk_style_set_font(g_ctx, &font->handle); }
+
     gui_set_daw_theme();
+
+    /* Scale style elements for DPI */
+    g_ctx->style.button.rounding = 3.0f * g_dpi_scale;
+    g_ctx->style.slider.bar_height = 6.0f * g_dpi_scale;
+
     return 0;
 }
 void gui_shutdown(void) {
@@ -110,8 +148,12 @@ void gui_process_events(int *quit) {
     nk_input_begin(g_ctx);
     while (SDL_PollEvent(&evt)) {
         if (evt.type == SDL_QUIT) *quit = 1;
-        if (evt.type == SDL_WINDOWEVENT && evt.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-            g_width = evt.window.data1; g_height = evt.window.data2; }
+        if (evt.type == SDL_WINDOWEVENT) {
+            if (evt.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                evt.window.event == SDL_WINDOWEVENT_RESIZED) {
+                SDL_GetWindowSize(g_window, &g_width, &g_height);
+            }
+        }
         nk_sdl_handle_event(&evt);
     }
     nk_input_end(g_ctx);
@@ -136,15 +178,17 @@ void gui_end_panel(void) { nk_end(g_ctx); }
 void gui_row_dynamic(float h, int c) { nk_layout_row_dynamic(g_ctx, h, c); }
 void gui_row_static(float h, int w, int c) { nk_layout_row_static(g_ctx, h, w, c); }
 float gui_slider(const char *label, float val, float mn, float mx, float step) {
-    nk_layout_row_dynamic(g_ctx, 20, 2);
+    float rh = 20.0f * g_dpi_scale;
+    nk_layout_row_dynamic(g_ctx, rh, 2);
     nk_label(g_ctx, label, NK_TEXT_LEFT);
     nk_slider_float(g_ctx, mn, &val, mx, step);
     return val;
 }
 float gui_knob(const char *label, float val, float mn, float mx) {
-    nk_layout_row_dynamic(g_ctx, 20, 1);
+    float rh = 20.0f * g_dpi_scale;
+    nk_layout_row_dynamic(g_ctx, rh, 1);
     nk_label(g_ctx, label, NK_TEXT_CENTERED);
-    nk_layout_row_dynamic(g_ctx, 20, 1);
+    nk_layout_row_dynamic(g_ctx, rh, 1);
     nk_slider_float(g_ctx, mn, &val, mx, (mx-mn)/100.0f);
     return val;
 }
@@ -159,7 +203,7 @@ int gui_property_int(const char *label, int mn, int val, int mx, int step, float
     nk_property_int(g_ctx, label, mn, &val, mx, step, ipp); return val; }
 void gui_meter(const char *label, float level) {
     if (level < 0.0f) level = 0.0f; if (level > 1.0f) level = 1.0f;
-    nk_layout_row_dynamic(g_ctx, 20, 2);
+    nk_layout_row_dynamic(g_ctx, 20.0f * g_dpi_scale, 2);
     nk_label(g_ctx, label, NK_TEXT_LEFT);
     struct nk_color c = (level > 0.9f) ? nk_rgb(255,50,50) :
                         (level > 0.7f) ? nk_rgb(255,200,50) : nk_rgb(50,200,80);
@@ -254,6 +298,13 @@ void gui_set_daw_theme(void) {
 (define gui-meter      (foreign-lambda void "gui_meter" c-string float))
 (define gui-sequencer-grid-raw
   (foreign-lambda int "gui_sequencer_grid" c-pointer int int int int int))
+(define gui-get-width  (foreign-lambda int "gui_get_width"))
+(define gui-get-height (foreign-lambda int "gui_get_height"))
+(define gui-get-dpi-scale (foreign-lambda float "gui_get_dpi_scale"))
+
+;; Scale a value by DPI
+(define (dpi* val)
+  (inexact->exact (round (* val (gui-get-dpi-scale)))))
 
 ;; SDL delay for timing
 (foreign-declare "void c_delay_ms(int ms) { SDL_Delay(ms); }")
@@ -415,9 +466,28 @@ void gui_set_daw_theme(void) {
               ;; ---- Draw GUI ----
               (gui-frame-begin)
 
+              ;; Get current window dimensions for responsive layout
+              (let* ((W (exact->inexact (gui-get-width)))
+                     (H (exact->inexact (gui-get-height)))
+                     (S (gui-get-dpi-scale))
+                     ;; Scaled row heights
+                     (row-h  (* 25.0 S))
+                     (row-sm (* 20.0 S))
+                     (row-lg (* 30.0 S))
+                     ;; Layout regions
+                     (transport-h (* 55.0 S))
+                     (mid-h (* 0.4 (- H transport-h)))   ;; 40% for seq+synth
+                     (mixer-h (- H transport-h mid-h))    ;; rest for mixer
+                     (mid-y transport-h)
+                     (mixer-y (+ transport-h mid-h))
+                     (half-w (* 0.5 W))
+                     ;; Grid cell sizes scale with available space
+                     (grid-cell-w (max 20 (inexact->exact (round (/ (- half-w (* 40.0 S)) 16.0)))))
+                     (grid-cell-h (max 16 (inexact->exact (round (/ (- mid-h (* 60.0 S)) 8.0))))))
+
               ;; Transport bar
-              (when (gui-begin-panel "Transport" 0.0 0.0 1280.0 55.0 8)
-                (gui-row-dynamic 30.0 8)
+              (when (gui-begin-panel "Transport" 0.0 0.0 W transport-h 8)
+                (gui-row-dynamic row-lg 8)
                 (gui-label "Audio DAC")
                 (set! bpm (gui-property-float "#BPM" 40.0
                             (exact->inexact bpm) 300.0 1.0 0.5))
@@ -440,19 +510,19 @@ void gui_set_daw_theme(void) {
                 (gui-end-panel))
 
               ;; Sequencer grid
-              (when (gui-begin-panel "Sequencer" 0.0 55.0 640.0 300.0 8)
+              (when (gui-begin-panel "Sequencer" 0.0 mid-y half-w mid-h 8)
                 ;; Row labels
-                (gui-row-dynamic 15.0 1)
+                (gui-row-dynamic (* 15.0 S) 1)
                 (gui-label "Click cells to toggle notes. Rows = tracks, Cols = steps")
                 ;; Grid
                 (gui-sequencer-grid-raw grid GRID_ROWS GRID_COLS
-                  (if playing? current-step -1) 35 28)
+                  (if playing? current-step -1) grid-cell-w grid-cell-h)
                 (gui-end-panel))
 
               ;; Synth editor
-              (when (gui-begin-panel "Synth" 640.0 55.0 640.0 300.0 8)
+              (when (gui-begin-panel "Synth" half-w mid-y half-w mid-h 8)
                 ;; Waveform selector
-                (gui-row-dynamic 25.0 5)
+                (gui-row-dynamic row-h 5)
                 (when (= (gui-button (if (= waveform 0) "[SIN]" "SIN")) 1)
                   (set! waveform 0)
                   (backend-send backend CMD_SET_WAVEFORM 0 0 0 0.0))
@@ -470,7 +540,7 @@ void gui_set_daw_theme(void) {
                   (backend-send backend CMD_SET_WAVEFORM 0 4 0 0.0))
 
                 ;; Filter
-                (gui-row-dynamic 20.0 1)
+                (gui-row-dynamic row-sm 1)
                 (gui-label "-- Filter --")
                 (let ((new-cutoff (gui-slider "Cutoff"
                                     (exact->inexact cutoff) 20.0 20000.0 10.0)))
@@ -486,17 +556,14 @@ void gui_set_daw_theme(void) {
                 (gui-end-panel))
 
               ;; Mixer
-              (when (gui-begin-panel "Mixer" 0.0 355.0 1280.0 445.0 8)
+              (when (gui-begin-panel "Mixer" 0.0 mixer-y W mixer-h 8)
                 ;; Track names
-                (gui-row-dynamic 20.0 8)
+                (gui-row-dynamic row-sm 8)
                 (do ((i 0 (+ i 1))) ((>= i 8))
                   (gui-label (string-append "Track " (number->string (+ i 1)))))
 
                 ;; Volume sliders
-                (do ((i 0 (+ i 1))) ((>= i 8))
-                  (gui-row-dynamic 20.0 1))  ;; spacer between tracks
-
-                (gui-row-dynamic 20.0 8)
+                (gui-row-dynamic row-sm 8)
                 (do ((i 0 (+ i 1))) ((>= i 8))
                   (let* ((vol (vector-ref track-volumes i))
                          (new-vol (gui-slider ""
@@ -507,7 +574,7 @@ void gui_set_daw_theme(void) {
                         (exact->inexact new-vol)))))
 
                 ;; Mute/Solo buttons
-                (gui-row-dynamic 25.0 8)
+                (gui-row-dynamic row-h 8)
                 (do ((i 0 (+ i 1))) ((>= i 8))
                   (let ((m (vector-ref track-mutes i)))
                     (when (= (gui-button (if m "[M]" "M")) 1)
@@ -515,7 +582,7 @@ void gui_set_daw_theme(void) {
                       (backend-send backend CMD_MUTE_TRACK i
                         (if (not m) 1 0) 0 0.0))))
 
-                (gui-row-dynamic 25.0 8)
+                (gui-row-dynamic row-h 8)
                 (do ((i 0 (+ i 1))) ((>= i 8))
                   (let ((s (vector-ref track-solos i)))
                     (when (= (gui-button (if s "[S]" "S")) 1)
@@ -524,6 +591,8 @@ void gui_set_daw_theme(void) {
                         (if (not s) 1 0) 0 0.0))))
 
                 (gui-end-panel))
+
+              ) ;; end let* for layout dimensions
 
               (gui-frame-end)
 
