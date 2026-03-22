@@ -70,10 +70,11 @@ void gui_set_daw_theme(void);
 int gui_get_width(void);
 int gui_get_height(void);
 
-/* Labeled sequencer grid: draws track labels on the left */
+/* Labeled sequencer grid with per-cell note values */
 int gui_sequencer_grid_labeled(int *grid_data, int rows, int cols,
     int current_step, int cell_w, int cell_h,
-    const char **row_labels, float dpi_scale);
+    const char **row_labels, float dpi_scale,
+    int *brush_notes);
 
 /* Horizontal separator */
 void gui_separator(float height);
@@ -273,14 +274,30 @@ void gui_set_daw_theme(void) {
     g_ctx->style.slider.bar_height = 6;
 }
 
+/* Note name lookup for grid cells.
+ * Grid now stores MIDI note values: 0 = empty, 1-127 = note */
+static const char *note_names_arr[] = {
+    \"C\",\"C#\",\"D\",\"D#\",\"E\",\"F\",\"F#\",\"G\",\"G#\",\"A\",\"A#\",\"B\"
+};
+
+static void midi_to_label(int note, char *buf, int buf_size) {
+    if (note <= 0 || note > 127) { buf[0] = 0; return; }
+    int name_idx = note % 12;
+    int octave = (note / 12) - 1;
+    snprintf(buf, buf_size, \"%s%d\", note_names_arr[name_idx], octave);
+}
+
+/* brush_notes: per-row \"current note\" for placing.
+ * When user clicks empty cell, this note value is placed.
+ * When user clicks active cell, it's cleared to 0. */
 int gui_sequencer_grid_labeled(int *grid_data, int rows, int cols,
     int current_step, int cell_w, int cell_h,
-    const char **row_labels, float dpi_scale) {
+    const char **row_labels, float dpi_scale,
+    int *brush_notes) {
     int changed = 0;
     int label_w = (int)(70.0f * dpi_scale);
 
     for (int r = 0; r < rows; r++) {
-        /* Row with label + grid cells */
         nk_layout_row_begin(g_ctx, NK_STATIC, (float)cell_h, cols + 1);
 
         /* Track label */
@@ -288,11 +305,14 @@ int gui_sequencer_grid_labeled(int *grid_data, int rows, int cols,
         struct nk_color label_clr = (r < 4) ? nk_rgb(80,180,220) : nk_rgb(220,160,80);
         nk_label_colored(g_ctx, row_labels[r], NK_TEXT_LEFT, label_clr);
 
-        /* Grid cells */
+        /* Grid cells - now store MIDI note values */
         for (int c = 0; c < cols; c++) {
             nk_layout_row_push(g_ctx, (float)cell_w);
             int idx = r * cols + c;
-            int active = grid_data[idx];
+            int note_val = grid_data[idx];  /* 0=empty, >0=MIDI note */
+            int active = (note_val > 0);
+
+            /* Cell color */
             struct nk_color clr;
             if (c == current_step) {
                 clr = active ? nk_rgb(255,180,50) : nk_rgb(70,70,45);
@@ -302,6 +322,7 @@ int gui_sequencer_grid_labeled(int *grid_data, int rows, int cols,
                 else
                     clr = (c % 4 == 0) ? nk_rgb(52,52,56) : nk_rgb(42,42,46);
             }
+
             struct nk_style_button style = g_ctx->style.button;
             style.normal = nk_style_item_color(clr);
             style.hover = nk_style_item_color(nk_rgb(
@@ -312,8 +333,19 @@ int gui_sequencer_grid_labeled(int *grid_data, int rows, int cols,
             style.border_color = nk_rgb(55,55,60);
             style.border = 1.0f;
             style.rounding = 2.0f;
-            if (nk_button_label_styled(g_ctx, &style, active ? \"#\" : \"\")) {
-                grid_data[idx] = !grid_data[idx];
+
+            /* Show note name in active cells */
+            char label[8] = \"\";
+            if (active) {
+                midi_to_label(note_val, label, sizeof(label));
+            }
+
+            if (nk_button_label_styled(g_ctx, &style, label)) {
+                if (active) {
+                    grid_data[idx] = 0;  /* Clear */
+                } else {
+                    grid_data[idx] = brush_notes[r];  /* Place current brush note */
+                }
                 changed = 1;
             }
         }
@@ -372,10 +404,10 @@ float gui_slider_inline(float val, float mn, float mx, float step) {
 (define gui-separator (foreign-lambda void "gui_separator" float))
 (define gui-slider-inline (foreign-lambda float "gui_slider_inline" float float float float))
 
-;; Labeled grid FFI - needs C string array
+;; Labeled grid FFI - needs C string array + brush notes array
 (define gui-sequencer-grid-labeled-raw
   (foreign-lambda int "gui_sequencer_grid_labeled"
-    c-pointer int int int int int c-pointer float))
+    c-pointer int int int int int c-pointer float c-pointer))
 
 ;; Scale a value by DPI
 (define (dpi* val)
@@ -444,6 +476,23 @@ float gui_slider_inline(float val, float mn, float mx, float step) {
 
 ;; Global for passing loaded BPM back
 (define *loaded-bpm* #f)
+
+;; ---- C int array for brush notes (per-track current note) ----
+(define int-array-alloc
+  (foreign-lambda* c-pointer ((int count))
+    "int *arr = (int *)calloc(count, sizeof(int)); C_return(arr);"))
+
+(define int-array-get
+  (foreign-lambda* int ((c-pointer arr) (int idx))
+    "C_return(((int*)arr)[idx]);"))
+
+(define int-array-set!
+  (foreign-lambda* void ((c-pointer arr) (int idx) (int val))
+    "((int*)arr)[idx] = val;"))
+
+(define int-array-free
+  (foreign-lambda* void ((c-pointer arr))
+    "free(arr);"))
 
 ;; ---- C string array for row labels ----
 (define row-labels-alloc
@@ -626,9 +675,10 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
         (format (current-error-port)
                 "  or: SDL_AUDIODRIVER=alsa ./audio-dac~%")))
 
-    ;; Allocate sequencer grid and row labels
+    ;; Allocate sequencer grid, row labels, and brush notes
     (let ((grid (grid-alloc (* GRID_ROWS GRID_COLS)))
-          (c-row-labels (row-labels-alloc GRID_ROWS)))
+          (c-row-labels (row-labels-alloc GRID_ROWS))
+          (c-brush-notes (int-array-alloc GRID_ROWS)))
 
       ;; DAW state
       (let ((bpm 120.0)
@@ -642,9 +692,10 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
             (track-mutes (make-vector 8 #f))
             (track-solos (make-vector 8 #f)))
 
-        ;; Set up C row label array
+        ;; Set up C row label array and brush notes
         (do ((i 0 (+ i 1))) ((>= i GRID_ROWS))
-          (row-labels-set! c-row-labels i (vector-ref grid-row-labels i)))
+          (row-labels-set! c-row-labels i (vector-ref grid-row-labels i))
+          (int-array-set! c-brush-notes i (vector-ref grid-row-notes i)))
 
         ;; Load presets for all tracks
         (do ((i 0 (+ i 1))) ((>= i GRID_ROWS))
@@ -671,20 +722,18 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                   (when (>= elapsed step-ms)
                     (let advance-loop ((remaining elapsed))
                       (when (>= remaining step-ms)
-                        ;; Note off previous step
+                        ;; Note off previous step (use the actual note stored in the cell)
                         (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                          (let ((note (vector-ref grid-row-notes r))
-                                (prev-active (grid-get grid (+ (* r GRID_COLS) current-step))))
-                            (when (= prev-active 1)
-                              (backend-send backend CMD_NOTE_OFF r note 0 0.0))))
+                          (let ((prev-note (grid-get grid (+ (* r GRID_COLS) current-step))))
+                            (when (> prev-note 0)
+                              (backend-send backend CMD_NOTE_OFF r prev-note 0 0.0))))
                         ;; Advance step
                         (set! current-step (modulo (+ current-step 1) GRID_COLS))
-                        ;; Note on current step
+                        ;; Note on current step (each cell has its own note value)
                         (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                          (let ((note (vector-ref grid-row-notes r))
-                                (active (grid-get grid (+ (* r GRID_COLS) current-step))))
-                            (when (= active 1)
-                              (backend-send backend CMD_NOTE_ON r note 100 0.0))))
+                          (let ((cell-note (grid-get grid (+ (* r GRID_COLS) current-step))))
+                            (when (> cell-note 0)
+                              (backend-send backend CMD_NOTE_ON r cell-note 100 0.0))))
                         (advance-loop (- remaining step-ms))))
                     (set! last-step-time now))))
 
@@ -757,7 +806,7 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                   grid GRID_ROWS GRID_COLS
                   (if playing? current-step -1)
                   grid-cell-w grid-cell-h
-                  c-row-labels S)
+                  c-row-labels S c-brush-notes)
                 (gui-end-panel))
 
               ;; ==== SOUNDS PANEL ====
@@ -778,22 +827,26 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                   (when (= (gui-button "-Oct") 1)
                     (let ((n (vector-ref grid-row-notes r)))
                       (when (>= n 12)
-                        (vector-set! grid-row-notes r (- n 12)))))
+                        (vector-set! grid-row-notes r (- n 12))
+                        (int-array-set! c-brush-notes r (- n 12)))))
                   ;; Semitone down
                   (when (= (gui-button "-") 1)
                     (let ((n (vector-ref grid-row-notes r)))
                       (when (> n 0)
-                        (vector-set! grid-row-notes r (- n 1)))))
+                        (vector-set! grid-row-notes r (- n 1))
+                        (int-array-set! c-brush-notes r (- n 1)))))
                   ;; Semitone up
                   (when (= (gui-button "+") 1)
                     (let ((n (vector-ref grid-row-notes r)))
                       (when (< n 127)
-                        (vector-set! grid-row-notes r (+ n 1)))))
+                        (vector-set! grid-row-notes r (+ n 1))
+                        (int-array-set! c-brush-notes r (+ n 1)))))
                   ;; Octave up
                   (when (= (gui-button "+Oct") 1)
                     (let ((n (vector-ref grid-row-notes r)))
                       (when (<= n 115)
-                        (vector-set! grid-row-notes r (+ n 12)))))
+                        (vector-set! grid-row-notes r (+ n 12))
+                        (int-array-set! c-brush-notes r (+ n 12)))))
                   ;; Preset buttons
                   (let* ((presets-for-row
                           (if (>= r 4)
@@ -874,6 +927,7 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
               (loop)))))) ;; loop, unless, let-quit, let-loop, let-track-presets
 
         ;; Cleanup
+        (int-array-free c-brush-notes)
         (row-labels-free c-row-labels GRID_ROWS)
         (grid-free grid)
         (backend-stop backend)
