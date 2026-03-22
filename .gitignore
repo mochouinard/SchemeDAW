@@ -1,0 +1,23 @@
+# Build artifacts
+*.o
+*.so
+*.a
+audio-dac
+audio-dac.c
+
+# Chicken Scheme generated
+*.import.scm
+*.link
+*.build.sh
+*.install.sh
+*.types
+
+# Editor files
+*~
+*.swp
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
