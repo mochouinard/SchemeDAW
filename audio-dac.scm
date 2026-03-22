@@ -115,6 +115,7 @@ int gui_init(int width, int height, const char *title) {
     if (SDL_GetDisplayDPI(display_idx, &dpi, NULL, NULL) == 0 && dpi > 0) {
         g_dpi_scale = dpi / 96.0f;  /* 96 DPI is the baseline */
         if (g_dpi_scale < 1.0f) g_dpi_scale = 1.0f;
+        if (g_dpi_scale > 2.0f) g_dpi_scale = 2.0f;  /* Cap at 2x */
     } else {
         /* Fallback: check renderer output vs window size */
         g_dpi_scale = 1.0f;
@@ -340,6 +341,9 @@ int gui_sequencer_grid_labeled(int *grid_data, int rows, int cols,
                 midi_to_label(note_val, label, sizeof(label));
             }
 
+            /* Capture cell bounds before drawing button */
+            struct nk_rect cell_bounds = nk_widget_bounds(g_ctx);
+
             if (nk_button_label_styled(g_ctx, &style, label)) {
                 if (active) {
                     grid_data[idx] = 0;  /* Clear */
@@ -347,6 +351,22 @@ int gui_sequencer_grid_labeled(int *grid_data, int rows, int cols,
                     grid_data[idx] = brush_notes[r];  /* Place current brush note */
                 }
                 changed = 1;
+            }
+
+            /* Mouse wheel over cell: scroll to change note by semitone */
+            {
+                struct nk_input *input = &g_ctx->input;
+                if (nk_input_is_mouse_hovering_rect(input, cell_bounds)) {
+                    float scroll = input->mouse.scroll_delta.y;
+                    if (active && (scroll > 0.1f || scroll < -0.1f)) {
+                        int delta = (scroll > 0) ? 1 : -1;
+                        int new_note = grid_data[idx] + delta;
+                        if (new_note < 1) new_note = 1;
+                        if (new_note > 127) new_note = 127;
+                        grid_data[idx] = new_note;
+                        changed = 1;
+                    }
+                }
             }
         }
         nk_layout_row_end(g_ctx);
