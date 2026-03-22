@@ -696,7 +696,7 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                                     (round (/ (- seq-h (* 80.0 S)) 8.0))))))
 
               ;; ==== TOOLBAR ====
-              (when (gui-begin-panel "##Toolbar" 0.0 0.0 W toolbar-h 8)
+              (when (gui-begin-panel "Toolbar" 0.0 0.0 W toolbar-h 8)
                 (gui-row-dynamic row-lg 10)
                 ;; File operations
                 (when (= (gui-button "Save") 1)
