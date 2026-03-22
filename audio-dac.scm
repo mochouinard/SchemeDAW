@@ -438,7 +438,7 @@ void gui_separator(float height) {
 
 (define row-labels-set!
   (foreign-lambda* void ((c-pointer arr) (int idx) (c-string str))
-    "((const char **)arr)[idx] = strdup(str);"))
+    "((const char **)arr)[idx] = str ? strdup(str) : strdup(\"\");"))
 
 (define row-labels-free
   (foreign-lambda* void ((c-pointer arr) (int count))
