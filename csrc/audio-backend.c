@@ -495,9 +495,13 @@ AudioBackend* backend_create(int sample_rate, int buffer_size) {
 int backend_start(AudioBackend *ab) {
     if (ab->running) return 0;
 
-    if (SDL_Init(SDL_INIT_AUDIO) < 0) {
-        fprintf(stderr, "SDL_Init(AUDIO) failed: %s\n", SDL_GetError());
-        return -1;
+    /* SDL audio may already be initialized by the GUI (SDL_INIT_VIDEO | SDL_INIT_AUDIO).
+     * SDL_InitSubSystem is safe to call multiple times. */
+    if (!SDL_WasInit(SDL_INIT_AUDIO)) {
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+            fprintf(stderr, "SDL_InitSubSystem(AUDIO) failed: %s\n", SDL_GetError());
+            return -1;
+        }
     }
 
     SDL_AudioSpec desired, obtained;
@@ -509,10 +513,35 @@ int backend_start(AudioBackend *ab) {
     desired.callback = audio_callback;
     desired.userdata = ab;
 
-    ab->device_id = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
+    /* Try default device first */
+    ab->device_id = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained,
+                                         SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
     if (ab->device_id == 0) {
-        fprintf(stderr, "SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
-        return -1;
+        fprintf(stderr, "Default audio device failed: %s\n", SDL_GetError());
+
+        /* Try each available audio driver */
+        int num_drivers = SDL_GetNumAudioDrivers();
+        for (int d = 0; d < num_drivers; d++) {
+            const char *driver = SDL_GetAudioDriver(d);
+            fprintf(stderr, "Trying audio driver: %s\n", driver);
+
+            /* Re-init audio subsystem with this driver */
+            SDL_QuitSubSystem(SDL_INIT_AUDIO);
+            SDL_setenv("SDL_AUDIODRIVER", driver, 1);
+            if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) continue;
+
+            ab->device_id = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained,
+                                                 SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+            if (ab->device_id != 0) {
+                fprintf(stderr, "Audio opened with driver: %s\n", driver);
+                break;
+            }
+        }
+
+        if (ab->device_id == 0) {
+            fprintf(stderr, "All audio drivers failed. Running without audio.\n");
+            return -1;
+        }
     }
 
     /* Update engine with actual sample rate if different */

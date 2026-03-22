@@ -391,6 +391,7 @@ float gui_slider_inline(float val, float mn, float mx, float step) {
         (bpm ,bpm)
         (presets ,(vector->list track-presets))
         (volumes ,(map exact->inexact (vector->list track-volumes)))
+        (notes ,(vector->list grid-row-notes))
         (grid ,(let loop ((i 0) (acc '()))
                  (if (>= i (* GRID_ROWS GRID_COLS))
                      (reverse acc)
@@ -424,6 +425,13 @@ float gui_slider_inline(float val, float mn, float mx, float step) {
                   (backend-send backend CMD_SET_VOLUME i 0 0
                     (exact->inexact (car vs)))
                   (loop (+ i 1) (cdr vs))))))
+          ;; Notes
+          (let ((notes-entry (assq 'notes body)))
+            (when notes-entry
+              (let loop ((i 0) (ns (cadr notes-entry)))
+                (when (and (< i GRID_ROWS) (pair? ns))
+                  (vector-set! grid-row-notes i (car ns))
+                  (loop (+ i 1) (cdr ns))))))
           ;; Grid
           (let ((grid-entry (assq 'grid body)))
             (when grid-entry
@@ -535,9 +543,10 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
 
 ;; ---- Note mapping for grid ----
 ;; Row 0-3: melodic tracks (C minor), Row 4-7: drum tracks
+;; Mutable vector so user can change notes
 (define grid-row-notes
-  #(48 51 55 60    ;; C3 Eb3 G3 C4 (C minor)
-    36 38 42 46))  ;; Kick Snare ClosedHH OpenHH
+  (vector 48 51 55 60    ;; C3 Eb3 G3 C4 (C minor)
+          36 38 42 46))  ;; Kick Snare ClosedHH OpenHH
 
 ;; Default presets for each row
 (define grid-row-presets
@@ -607,10 +616,15 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
       (error "Failed to initialize GUI"))
 
     ;; Start audio after GUI (SDL already initialized)
-    (when (< (backend-start backend) 0)
-      (gui-shutdown)
-      (backend-destroy backend)
-      (error "Failed to start audio"))
+    ;; Don't crash if audio fails - GUI still works, just no sound
+    (let ((audio-ok (>= (backend-start backend) 0)))
+      (unless audio-ok
+        (format (current-error-port)
+                "WARNING: Audio device failed. GUI will work but no sound.~%")
+        (format (current-error-port)
+                "Try: SDL_AUDIODRIVER=pipewire ./audio-dac~%")
+        (format (current-error-port)
+                "  or: SDL_AUDIODRIVER=alsa ./audio-dac~%")))
 
     ;; Allocate sequencer grid and row labels
     (let ((grid (grid-alloc (* GRID_ROWS GRID_COLS)))
@@ -748,17 +762,38 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
 
               ;; ==== SOUNDS PANEL ====
               (when (gui-begin-panel "Sounds" seq-w seq-y sounds-w seq-h 8)
-                ;; Track preset selectors
+                ;; Track preset selectors with note control
                 (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                  ;; Track header
-                  (gui-row-dynamic (* 16.0 S) 2)
+                  ;; Track header: name, note, -oct, -1, +1, +oct
+                  (gui-row-dynamic (* 18.0 S) 6)
                   (gui-label-colored
                     (string-append (number->string (+ r 1)) ". "
                       (vector-ref grid-row-labels r))
                     (if (< r 4) 80 220) (if (< r 4) 180 160) (if (< r 4) 220 80))
+                  ;; Current note display
                   (gui-label-colored
-                    (vector-ref preset-names (vector-ref track-presets r))
-                    160 200 160)
+                    (note-name (vector-ref grid-row-notes r))
+                    200 220 160)
+                  ;; Octave down
+                  (when (= (gui-button "-Oct") 1)
+                    (let ((n (vector-ref grid-row-notes r)))
+                      (when (>= n 12)
+                        (vector-set! grid-row-notes r (- n 12)))))
+                  ;; Semitone down
+                  (when (= (gui-button "-") 1)
+                    (let ((n (vector-ref grid-row-notes r)))
+                      (when (> n 0)
+                        (vector-set! grid-row-notes r (- n 1)))))
+                  ;; Semitone up
+                  (when (= (gui-button "+") 1)
+                    (let ((n (vector-ref grid-row-notes r)))
+                      (when (< n 127)
+                        (vector-set! grid-row-notes r (+ n 1)))))
+                  ;; Octave up
+                  (when (= (gui-button "+Oct") 1)
+                    (let ((n (vector-ref grid-row-notes r)))
+                      (when (<= n 115)
+                        (vector-set! grid-row-notes r (+ n 12)))))
                   ;; Preset buttons
                   (let* ((presets-for-row
                           (if (>= r 4)
