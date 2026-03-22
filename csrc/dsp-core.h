@@ -7,7 +7,7 @@
 #define MAX_TRACKS        16
 #define MAX_FX_PER_TRACK   8
 #define MAX_OSC_PER_VOICE  3
-#define BLOCK_SIZE        256
+#define BLOCK_SIZE       1024
 
 /* Waveform types */
 #define WAVE_SINE     0
