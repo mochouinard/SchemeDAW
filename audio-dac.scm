@@ -334,6 +334,35 @@ void gui_set_daw_theme(void) {
 (define WAVE_SINE 0) (define WAVE_SAW 1)
 (define WAVE_SQUARE 2) (define WAVE_TRIANGLE 3) (define WAVE_NOISE 4)
 
+(define CMD_SET_OSC_COUNT  #x0F)
+(define CMD_SET_OSC2       #x10)
+(define CMD_SET_OSC3       #x11)
+(define CMD_SET_FM         #x12)
+(define CMD_SET_PITCH_ENV  #x13)
+(define CMD_SET_SYNTH_TYPE #x14)
+(define CMD_SET_EXP_ENV    #x15)
+(define CMD_LOAD_PRESET    #x20)
+
+;; Preset names (must match C load_builtin_preset indices)
+(define preset-names
+  #("Supersaw Lead"   ;; 0
+    "Deep Sub Bass"    ;; 1
+    "Acid Bass 303"    ;; 2
+    "Warm Pad"         ;; 3
+    "FM Bell"          ;; 4
+    "FM E.Piano"       ;; 5
+    "808 Kick"         ;; 6
+    "Snare"            ;; 7
+    "HiHat Closed"     ;; 8
+    "HiHat Open"       ;; 9
+    "Clap"             ;; 10
+    "Pluck"            ;; 11
+    "Stab"             ;; 12
+    "Reese Bass"       ;; 13
+    "Strings"          ;; 14
+    "Brass"            ;; 15
+    ))
+
 ;; ---- Sequencer Grid State (C-allocated for FFI) ----
 (define GRID_ROWS 8)   ;; 8 tracks
 (define GRID_COLS 16)  ;; 16 steps
@@ -355,10 +384,26 @@ void gui_set_daw_theme(void) {
     "free(grid);"))
 
 ;; ---- Note mapping for grid ----
-;; Row 0-3: melodic tracks, Row 4-7: drum tracks
+;; Row 0-3: melodic tracks (C minor), Row 4-7: drum tracks
 (define grid-row-notes
-  #(60 64 67 72    ;; C4 E4 G4 C5 (C major chord)
+  #(48 51 55 60    ;; C3 Eb3 G3 C4 (C minor)
     36 38 42 46))  ;; Kick Snare ClosedHH OpenHH
+
+;; Default presets for each row
+(define grid-row-presets
+  #(0   ;; Row 0: Supersaw Lead
+    13  ;; Row 1: Reese Bass
+    11  ;; Row 2: Pluck
+    3   ;; Row 3: Warm Pad
+    6   ;; Row 4: 808 Kick
+    7   ;; Row 5: Snare
+    8   ;; Row 6: HiHat Closed
+    9   ;; Row 7: HiHat Open
+    ))
+
+;; Row labels for the sequencer
+(define grid-row-labels
+  #("Lead" "Bass" "Pluck" "Pad" "Kick" "Snare" "HH-C" "HH-O"))
 
 ;; ---- Helper ----
 (define (note-name midi-note)
@@ -432,8 +477,15 @@ void gui_set_daw_theme(void) {
             (track-mutes (make-vector 8 #f))
             (track-solos (make-vector 8 #f)))
 
-        ;; Set initial synth params
-        (backend-send backend CMD_SET_WAVEFORM 0 WAVE_SAW 0 0.0)
+        ;; Load presets for all tracks
+        (do ((i 0 (+ i 1))) ((>= i GRID_ROWS))
+          (backend-send backend CMD_LOAD_PRESET i
+            (vector-ref grid-row-presets i) 0 0.0))
+
+        ;; Track preset state
+        (let ((track-presets (make-vector 8 0)))
+          (do ((i 0 (+ i 1))) ((>= i GRID_ROWS))
+            (vector-set! track-presets i (vector-ref grid-row-presets i)))
 
         ;; Main loop
         (let loop ()
@@ -519,29 +571,46 @@ void gui_set_daw_theme(void) {
                   (if playing? current-step -1) grid-cell-w grid-cell-h)
                 (gui-end-panel))
 
-              ;; Synth editor
-              (when (gui-begin-panel "Synth" half-w mid-y half-w mid-h 8)
-                ;; Waveform selector
-                (gui-row-dynamic row-h 5)
-                (when (= (gui-button (if (= waveform 0) "[SIN]" "SIN")) 1)
-                  (set! waveform 0)
-                  (backend-send backend CMD_SET_WAVEFORM 0 0 0 0.0))
-                (when (= (gui-button (if (= waveform 1) "[SAW]" "SAW")) 1)
-                  (set! waveform 1)
-                  (backend-send backend CMD_SET_WAVEFORM 0 1 0 0.0))
-                (when (= (gui-button (if (= waveform 2) "[SQR]" "SQR")) 1)
-                  (set! waveform 2)
-                  (backend-send backend CMD_SET_WAVEFORM 0 2 0 0.0))
-                (when (= (gui-button (if (= waveform 3) "[TRI]" "TRI")) 1)
-                  (set! waveform 3)
-                  (backend-send backend CMD_SET_WAVEFORM 0 3 0 0.0))
-                (when (= (gui-button (if (= waveform 4) "[NSE]" "NSE")) 1)
-                  (set! waveform 4)
-                  (backend-send backend CMD_SET_WAVEFORM 0 4 0 0.0))
+              ;; Synth editor - preset selector per track
+              (when (gui-begin-panel "Sounds" half-w mid-y half-w mid-h 8)
+                (gui-row-dynamic (* 18.0 S) 1)
+                (gui-label "Track Presets (click to change)")
 
-                ;; Filter
-                (gui-row-dynamic row-sm 1)
-                (gui-label "-- Filter --")
+                ;; For each track row, show label + preset buttons
+                (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
+                  (gui-row-dynamic row-h 5)
+                  (gui-label-colored (vector-ref grid-row-labels r) 80 180 220)
+                  ;; Show 4 preset options relevant to this row
+                  (let* ((is-drum (>= r 4))
+                         ;; Preset groups: melodic or drum
+                         (presets-for-row
+                          (if is-drum
+                              (case r
+                                ((4) #(6 1 2 13))   ;; kick row: 808 Kick, Sub, Acid, Reese
+                                ((5) #(7 10 12 11)) ;; snare row: Snare, Clap, Stab, Pluck
+                                ((6) #(8 9 10 4))   ;; hh-c: HH-C, HH-O, Clap, Bell
+                                ((7) #(9 8 4 5))    ;; hh-o: HH-O, HH-C, Bell, EPiano
+                                (else #(6 7 8 9)))
+                              (case r
+                                ((0) #(0 15 11 12))  ;; lead: Supersaw, Brass, Pluck, Stab
+                                ((1) #(13 1 2 14))   ;; bass: Reese, Sub, Acid, Strings
+                                ((2) #(11 4 5 12))   ;; pluck: Pluck, Bell, EPiano, Stab
+                                ((3) #(3 14 5 4))    ;; pad: Pad, Strings, EPiano, Bell
+                                (else #(0 1 2 3))))))
+                    (do ((p 0 (+ p 1))) ((>= p 4))
+                      (let* ((preset-idx (vector-ref presets-for-row p))
+                             (pname (vector-ref preset-names preset-idx))
+                             (is-active (= (vector-ref track-presets r) preset-idx))
+                             (label (if is-active
+                                        (string-append "[" pname "]")
+                                        pname)))
+                        (when (= (gui-button label) 1)
+                          (vector-set! track-presets r preset-idx)
+                          (backend-send backend CMD_LOAD_PRESET r preset-idx 0 0.0))))))
+
+                ;; Filter control for selected track
+                (gui-row-dynamic (* 12.0 S) 1)
+                (gui-label "-- Master Filter (Track 0) --")
                 (let ((new-cutoff (gui-slider "Cutoff"
                                     (exact->inexact cutoff) 20.0 20000.0 10.0)))
                   (when (not (= new-cutoff cutoff))
@@ -555,16 +624,29 @@ void gui_set_daw_theme(void) {
 
                 (gui-end-panel))
 
-              ;; Mixer
+              ;; Mixer - each track as a vertical strip: [M][S] Name Vol
               (when (gui-begin-panel "Mixer" 0.0 mixer-y W mixer-h 8)
-                ;; Track names
-                (gui-row-dynamic row-sm 8)
+                ;; Per-track rows: M/S buttons on left, then name, then volume
                 (do ((i 0 (+ i 1))) ((>= i 8))
-                  (gui-label (string-append "Track " (number->string (+ i 1)))))
-
-                ;; Volume sliders
-                (gui-row-dynamic row-sm 8)
-                (do ((i 0 (+ i 1))) ((>= i 8))
+                  (gui-row-dynamic row-h 5)
+                  ;; Mute button (left)
+                  (let ((m (vector-ref track-mutes i)))
+                    (when (= (gui-button (if m "M!" "M")) 1)
+                      (vector-set! track-mutes i (not m))
+                      (backend-send backend CMD_MUTE_TRACK i
+                        (if (not m) 1 0) 0 0.0)))
+                  ;; Solo button
+                  (let ((s (vector-ref track-solos i)))
+                    (when (= (gui-button (if s "S!" "S")) 1)
+                      (vector-set! track-solos i (not s))
+                      (backend-send backend CMD_SOLO_TRACK i
+                        (if (not s) 1 0) 0 0.0)))
+                  ;; Track label with preset name
+                  (gui-label-colored
+                    (string-append (vector-ref grid-row-labels i) " - "
+                      (vector-ref preset-names (vector-ref track-presets i)))
+                    180 200 220)
+                  ;; Volume slider (takes 2 columns)
                   (let* ((vol (vector-ref track-volumes i))
                          (new-vol (gui-slider ""
                                     (exact->inexact vol) 0.0 1.0 0.01)))
@@ -573,37 +655,20 @@ void gui_set_daw_theme(void) {
                       (backend-send backend CMD_SET_VOLUME i 0 0
                         (exact->inexact new-vol)))))
 
-                ;; Mute/Solo buttons
-                (gui-row-dynamic row-h 8)
-                (do ((i 0 (+ i 1))) ((>= i 8))
-                  (let ((m (vector-ref track-mutes i)))
-                    (when (= (gui-button (if m "[M]" "M")) 1)
-                      (vector-set! track-mutes i (not m))
-                      (backend-send backend CMD_MUTE_TRACK i
-                        (if (not m) 1 0) 0 0.0))))
-
-                (gui-row-dynamic row-h 8)
-                (do ((i 0 (+ i 1))) ((>= i 8))
-                  (let ((s (vector-ref track-solos i)))
-                    (when (= (gui-button (if s "[S]" "S")) 1)
-                      (vector-set! track-solos i (not s))
-                      (backend-send backend CMD_SOLO_TRACK i
-                        (if (not s) 1 0) 0 0.0))))
-
                 (gui-end-panel))
 
               ) ;; end let* for layout dimensions
 
               (gui-frame-end)
 
-              (loop))))
+              (loop)))))) ;; loop, unless, let-quit, let-loop, let-track-presets
 
         ;; Cleanup
         (grid-free grid)
         (backend-stop backend)
         (gui-shutdown)
         (backend-destroy backend)
-        (format #t "Goodbye.~%")))))
+        (format #t "Goodbye.~%")))) ;; let-state, let-grid, let-backend, main-gui
 
 ;; Run
 (main)

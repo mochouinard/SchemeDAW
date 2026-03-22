@@ -168,6 +168,51 @@ float envelope_process_sample(Envelope *e) {
     return e->level;
 }
 
+/* Exponential envelope - sounds much more natural for musical use.
+ * Uses multiplicative decay instead of linear subtraction. */
+float envelope_process_sample_exp(Envelope *e) {
+    switch (e->stage) {
+        case ENV_ATTACK: {
+            float rate = (e->attack > 0.001f) ? 1.0f / (e->attack * e->sample_rate) : 1.0f;
+            e->level += rate;
+            if (e->level >= 1.0f) {
+                e->level = 1.0f;
+                e->stage = ENV_DECAY;
+            }
+            break;
+        }
+        case ENV_DECAY: {
+            /* Exponential decay toward sustain level */
+            float target = e->sustain;
+            float coeff = expf(-1.0f / (e->decay * e->sample_rate + 1.0f));
+            e->level = target + (e->level - target) * coeff;
+            if (fabsf(e->level - target) < 0.001f) {
+                e->level = target;
+                e->stage = ENV_SUSTAIN;
+            }
+            break;
+        }
+        case ENV_SUSTAIN:
+            e->level = e->sustain;
+            break;
+        case ENV_RELEASE: {
+            /* Exponential decay toward zero */
+            float coeff = expf(-1.0f / (e->release * e->sample_rate + 1.0f));
+            e->level *= coeff;
+            if (e->level < 0.0001f) {
+                e->level = 0.0f;
+                e->stage = ENV_IDLE;
+            }
+            break;
+        }
+        case ENV_IDLE:
+        default:
+            e->level = 0.0f;
+            break;
+    }
+    return e->level;
+}
+
 /* ---- Voice ---- */
 
 void voice_init(Voice *v) {
@@ -188,8 +233,31 @@ void voice_note_on(Voice *v, int note, float velocity, float sample_rate,
     float freq = midi_to_freq(note);
 
     /* Set up oscillators from track defaults */
-    v->osc_count = 1;
+    v->osc_count = track->default_osc_count;
+    if (v->osc_count < 1) v->osc_count = 1;
+    if (v->osc_count > MAX_OSC_PER_VOICE) v->osc_count = MAX_OSC_PER_VOICE;
+
+    /* Osc 1: main oscillator */
     osc_init(&v->osc[0], track->default_waveform, freq, sample_rate);
+    v->osc[0].mix_level = 1.0f;
+
+    /* Osc 2: detuned / octave shifted */
+    if (v->osc_count >= 2) {
+        float osc2_freq = freq * powf(2.0f, track->default_osc2_octave)
+                              * powf(2.0f, track->default_osc2_detune / 12.0f);
+        osc_init(&v->osc[1], track->default_osc2_wave, osc2_freq, sample_rate);
+        v->osc[1].mix_level = track->default_osc2_mix;
+        v->osc[1].detune = track->default_osc2_detune;
+    }
+
+    /* Osc 3: sub / texture layer */
+    if (v->osc_count >= 3) {
+        float osc3_freq = freq * powf(2.0f, track->default_osc3_octave)
+                              * powf(2.0f, track->default_osc3_detune / 12.0f);
+        osc_init(&v->osc[2], track->default_osc3_wave, osc3_freq, sample_rate);
+        v->osc[2].mix_level = track->default_osc3_mix;
+        v->osc[2].detune = track->default_osc3_detune;
+    }
 
     /* Filter from track defaults */
     filter_init(&v->filter, track->default_filter_type,
@@ -216,41 +284,103 @@ void voice_note_off(Voice *v) {
     envelope_gate_off(&v->filter_env);
 }
 
-void voice_render(Voice *v, float *left, float *right, int frames, float sample_rate) {
+void voice_render_internal(Voice *v, float *left, float *right, int frames,
+                           float sample_rate, Track *track) {
     if (!v->active) return;
 
     float mono_buf[BLOCK_SIZE];
+    int use_exp = track->default_exp_envelope;
+    int synth_type = track->synth_type;
+
+    /* Pitch envelope state */
+    float pitch_env_amount = track->default_pitch_env_amount;
+    float pitch_env_decay = track->default_pitch_env_decay;
+    float pitch_env_level = (pitch_env_amount != 0.0f) ? 1.0f : 0.0f;
+    float pitch_env_rate = (pitch_env_decay > 0.001f)
+        ? 1.0f / (pitch_env_decay * sample_rate) : 1.0f;
+
+    /* FM synthesis parameters */
+    float fm_ratio = track->default_fm_ratio;
+    float fm_index = track->default_fm_index;
 
     for (int i = 0; i < frames; i++) {
-        /* Mix oscillators */
         float osc_out = 0.0f;
-        for (int o = 0; o < v->osc_count; o++) {
-            osc_out += osc_process_sample(&v->osc[o]);
+        float total_mix = 0.0f;
+
+        /* Apply pitch envelope (decays from pitch_env_amount to 0 semitones) */
+        if (pitch_env_amount != 0.0f && pitch_env_level > 0.001f) {
+            float pitch_shift = pitch_env_amount * pitch_env_level;
+            float pitch_mult = powf(2.0f, pitch_shift / 12.0f);
+            /* Temporarily adjust osc[0] phase_inc */
+            float base_freq = v->osc[0].frequency;
+            v->osc[0].phase_inc = (base_freq * pitch_mult) / sample_rate;
+            pitch_env_level -= pitch_env_rate;
+            if (pitch_env_level < 0.0f) pitch_env_level = 0.0f;
         }
-        if (v->osc_count > 1) {
-            osc_out /= (float)v->osc_count;
+
+        if (synth_type == 1 && fm_ratio > 0.0f && fm_index > 0.0f) {
+            /* FM synthesis: osc[0] is carrier, modulator is generated inline */
+            float mod_freq = v->osc[0].frequency * fm_ratio;
+            static float fm_mod_phase = 0.0f; /* simple static - OK for now */
+            float mod_out = sinf(TWO_PI * fm_mod_phase) * fm_index;
+            fm_mod_phase += mod_freq / sample_rate;
+            if (fm_mod_phase >= 1.0f) fm_mod_phase -= 1.0f;
+
+            /* Modulate carrier phase */
+            float carrier_phase = v->osc[0].phase + mod_out;
+            osc_out = sinf(TWO_PI * carrier_phase);
+            v->osc[0].phase += v->osc[0].phase_inc;
+            if (v->osc[0].phase >= 1.0f) v->osc[0].phase -= 1.0f;
+            total_mix = 1.0f;
+        } else {
+            /* Additive: mix all oscillators with their mix levels */
+            for (int o = 0; o < v->osc_count; o++) {
+                float s = osc_process_sample(&v->osc[o]);
+                osc_out += s * v->osc[o].mix_level;
+                total_mix += v->osc[o].mix_level;
+            }
+            /* Normalize by total mix to prevent clipping */
+            if (total_mix > 1.0f) {
+                osc_out /= total_mix;
+            }
         }
 
         mono_buf[i] = osc_out;
     }
 
-    /* Apply filter with envelope modulation */
+    /* Apply filter with envelope modulation (per-sample for accuracy) */
     float base_cutoff = v->filter.cutoff;
+    float fc_min = 20.0f, fc_max = clampf(sample_rate * 0.45f, 20.0f, 20000.0f);
+
     for (int i = 0; i < frames; i++) {
-        float filt_env = envelope_process_sample(&v->filter_env);
-        v->filter.cutoff = base_cutoff + v->filter_env_amount * filt_env;
-        if (v->filter.cutoff < 20.0f) v->filter.cutoff = 20.0f;
-        if (v->filter.cutoff > 20000.0f) v->filter.cutoff = 20000.0f;
+        float filt_env = use_exp ? envelope_process_sample_exp(&v->filter_env)
+                                 : envelope_process_sample(&v->filter_env);
+        float fc = base_cutoff + v->filter_env_amount * filt_env;
+        v->filter.cutoff = clampf(fc, fc_min, fc_max);
+
+        /* Inline single-sample filter for per-sample cutoff modulation */
+        float f = 2.0f * sinf((float)M_PI * v->filter.cutoff / sample_rate);
+        float q = 1.0f - clampf(v->filter.resonance, 0.0f, 0.99f);
+        float input = mono_buf[i];
+        v->filter.low  += f * v->filter.band;
+        v->filter.high  = input - v->filter.low - q * v->filter.band;
+        v->filter.band += f * v->filter.high;
+
+        switch (v->filter.type) {
+            case FILTER_LP: mono_buf[i] = v->filter.low;  break;
+            case FILTER_HP: mono_buf[i] = v->filter.high; break;
+            case FILTER_BP: mono_buf[i] = v->filter.band; break;
+        }
     }
-    v->filter.cutoff = base_cutoff; /* restore for next block */
-    filter_process(&v->filter, mono_buf, frames, sample_rate);
+    v->filter.cutoff = base_cutoff;
 
     /* Apply amp envelope and pan, mix into output */
     float pan_r = (v->pan + 1.0f) * 0.5f;
     float pan_l = 1.0f - pan_r;
 
     for (int i = 0; i < frames; i++) {
-        float amp = envelope_process_sample(&v->amp_env);
+        float amp = use_exp ? envelope_process_sample_exp(&v->amp_env)
+                            : envelope_process_sample(&v->amp_env);
         float sample = mono_buf[i] * amp * v->velocity;
 
         left[i]  += sample * pan_l;
@@ -261,6 +391,14 @@ void voice_render(Voice *v, float *left, float *right, int frames, float sample_
     if (v->amp_env.stage == ENV_IDLE) {
         v->active = 0;
     }
+}
+
+/* Legacy wrapper for compatibility */
+void voice_render(Voice *v, float *left, float *right, int frames, float sample_rate) {
+    /* Create a temporary default track for backward compat */
+    Track tmp;
+    track_init(&tmp);
+    voice_render_internal(v, left, right, frames, sample_rate, &tmp);
 }
 
 /* ---- Track ---- */
@@ -289,6 +427,28 @@ void track_init(Track *t) {
     t->default_filt_r = 0.5f;
     t->default_filt_env_amount = 2000.0f;
 
+    /* Multi-oscillator defaults */
+    t->default_osc_count = 1;
+    t->default_osc2_wave = WAVE_SAW;
+    t->default_osc3_wave = WAVE_SINE;
+    t->default_osc2_detune = 0.0f;
+    t->default_osc3_detune = 0.0f;
+    t->default_osc2_mix = 0.8f;
+    t->default_osc3_mix = 0.5f;
+    t->default_osc2_octave = 0.0f;
+    t->default_osc3_octave = 0.0f;
+
+    /* FM defaults */
+    t->default_fm_ratio = 2.0f;
+    t->default_fm_index = 0.0f;
+
+    /* Pitch envelope off by default */
+    t->default_pitch_env_amount = 0.0f;
+    t->default_pitch_env_decay = 0.1f;
+
+    /* Use exponential envelopes by default (sounds better) */
+    t->default_exp_envelope = 1;
+
     for (int i = 0; i < MAX_VOICES; i++) {
         voice_init(&t->voices[i]);
     }
@@ -303,7 +463,7 @@ void track_render(Track *t, float *left, float *right, int frames, float sample_
 
     for (int i = 0; i < MAX_VOICES; i++) {
         if (t->voices[i].active) {
-            voice_render(&t->voices[i], left, right, frames, sample_rate);
+            voice_render_internal(&t->voices[i], left, right, frames, sample_rate, t);
         }
     }
 

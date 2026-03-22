@@ -95,7 +95,7 @@ typedef struct {
     float  pan;
     int    mute;
     int    solo;
-    int    synth_type;             /* 0=subtractive, 1=fm */
+    int    synth_type;             /* 0=subtractive, 1=fm, 2=unison */
     /* Default synth parameters for new voices on this track */
     int    default_waveform;
     float  default_cutoff;
@@ -104,6 +104,24 @@ typedef struct {
     float  default_amp_a, default_amp_d, default_amp_s, default_amp_r;
     float  default_filt_a, default_filt_d, default_filt_s, default_filt_r;
     float  default_filt_env_amount;
+    /* Multi-oscillator / unison */
+    int    default_osc_count;      /* 1-3 oscillators */
+    int    default_osc2_wave;      /* waveform for osc 2 */
+    int    default_osc3_wave;      /* waveform for osc 3 */
+    float  default_osc2_detune;    /* semitones */
+    float  default_osc3_detune;    /* semitones */
+    float  default_osc2_mix;       /* 0.0-1.0 */
+    float  default_osc3_mix;       /* 0.0-1.0 */
+    float  default_osc2_octave;    /* -2, -1, 0, +1, +2 octave shift */
+    float  default_osc3_octave;    /* -2, -1, 0, +1, +2 octave shift */
+    /* FM synthesis */
+    float  default_fm_ratio;       /* modulator freq ratio */
+    float  default_fm_index;       /* modulation depth */
+    /* Pitch envelope (for kicks, risers, etc.) */
+    float  default_pitch_env_amount; /* semitones sweep */
+    float  default_pitch_env_decay;  /* decay time in seconds */
+    /* Exponential envelope mode (sounds more natural) */
+    int    default_exp_envelope;     /* 0=linear, 1=exponential */
 } Track;
 
 typedef struct {

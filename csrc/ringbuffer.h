@@ -19,6 +19,14 @@
 #define CMD_SET_WAVEFORM  0x0C
 #define CMD_SET_FILTER    0x0D
 #define CMD_SET_ENVELOPE  0x0E
+#define CMD_SET_OSC_COUNT 0x0F
+#define CMD_SET_OSC2      0x10  /* param1: field(0=wave,1=detune,2=mix,3=octave) */
+#define CMD_SET_OSC3      0x11  /* same as OSC2 */
+#define CMD_SET_FM        0x12  /* param1: 0=ratio, 1=index */
+#define CMD_SET_PITCH_ENV 0x13  /* param1: 0=amount, 1=decay */
+#define CMD_SET_SYNTH_TYPE 0x14
+#define CMD_SET_EXP_ENV   0x15  /* param1: 0=linear, 1=exponential */
+#define CMD_LOAD_PRESET   0x20  /* param1: preset index */
 
 /* Fixed-size command message */
 typedef struct {
