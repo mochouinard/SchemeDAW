@@ -7,7 +7,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-static float clampf(float x, float lo, float hi) {
+static float fx_clampf(float x, float lo, float hi) {
     if (x < lo) return lo;
     if (x > hi) return hi;
     return x;
@@ -30,9 +30,9 @@ void delay_init(DelayEffect *d, float sample_rate) {
 }
 
 void delay_set_params(DelayEffect *d, float time, float feedback, float mix) {
-    d->delay_time = clampf(time, 0.001f, 2.0f);
-    d->feedback = clampf(feedback, 0.0f, 0.95f);
-    d->mix = clampf(mix, 0.0f, 1.0f);
+    d->delay_time = fx_clampf(time, 0.001f, 2.0f);
+    d->feedback = fx_clampf(feedback, 0.0f, 0.95f);
+    d->mix = fx_clampf(mix, 0.0f, 1.0f);
 }
 
 void delay_process(DelayEffect *d, float *left, float *right, int frames) {
@@ -127,10 +127,10 @@ void reverb_init(ReverbEffect *r, float sample_rate) {
 
 void reverb_set_params(ReverbEffect *r, float room_size, float damping,
                        float mix, float width) {
-    r->room_size = clampf(room_size, 0.0f, 1.0f);
-    r->damping = clampf(damping, 0.0f, 1.0f);
-    r->mix = clampf(mix, 0.0f, 1.0f);
-    r->width = clampf(width, 0.0f, 1.0f);
+    r->room_size = fx_clampf(room_size, 0.0f, 1.0f);
+    r->damping = fx_clampf(damping, 0.0f, 1.0f);
+    r->mix = fx_clampf(mix, 0.0f, 1.0f);
+    r->width = fx_clampf(width, 0.0f, 1.0f);
 
     /* Update comb feedback based on room size */
     float feedback = 0.7f + 0.28f * r->room_size;
@@ -219,10 +219,10 @@ void distortion_init(DistortionEffect *d, float sample_rate) {
 
 void distortion_set_params(DistortionEffect *d, float drive, float tone,
                            float mix, float output_gain) {
-    d->drive = clampf(drive, 1.0f, 100.0f);
-    d->tone = clampf(tone, 200.0f, 20000.0f);
-    d->mix = clampf(mix, 0.0f, 1.0f);
-    d->output_gain = clampf(output_gain, 0.0f, 2.0f);
+    d->drive = fx_clampf(drive, 1.0f, 100.0f);
+    d->tone = fx_clampf(tone, 200.0f, 20000.0f);
+    d->mix = fx_clampf(mix, 0.0f, 1.0f);
+    d->output_gain = fx_clampf(output_gain, 0.0f, 2.0f);
 }
 
 void distortion_process(DistortionEffect *d, float *left, float *right, int frames) {
