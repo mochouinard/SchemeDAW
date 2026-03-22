@@ -771,7 +771,7 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                      (row-lg (* 30.0 S))
                      (pad    (* 4.0 S))
                      ;; Layout: toolbar | sequencer+sounds | mixer
-                     (toolbar-h (* 50.0 S))
+                     (toolbar-h (* 100.0 S))
                      (mixer-h   (* 0.28 (- H toolbar-h)))
                      (seq-h     (- H toolbar-h mixer-h))
                      (seq-y     toolbar-h)
@@ -786,39 +786,37 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                      (grid-cell-h (max 14 (inexact->exact
                                     (round (/ (- seq-h (* 80.0 S)) 8.0))))))
 
-              ;; ==== TOOLBAR (no title bar, flag 24 = 16+8) ====
-              (when (gui-begin-panel "Toolbar" 0.0 0.0 W toolbar-h 24)
-                (gui-row-dynamic row-lg 10)
-                ;; File operations
-                (when (= (gui-button "Save") 1)
-                  (save-project! "project.daw" grid bpm track-presets track-volumes))
-                (when (= (gui-button "Load") 1)
-                  (load-project! "project.daw" grid track-presets track-volumes backend)
-                  (when *loaded-bpm* (set! bpm *loaded-bpm*) (set! *loaded-bpm* #f)))
-                ;; Separator
-                (gui-label "|")
-                ;; Transport
-                (when (= (gui-button (if playing? "Stop" "Play")) 1)
-                  (set! playing? (not playing?))
-                  (if playing?
-                      ;; Starting: reset timer to now so we don't catch up
-                      (set! last-step-time (c-get-ticks))
-                      ;; Stopping: all notes off, reset position
-                      (begin
-                        (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                          (backend-send backend CMD_ALL_NOTES_OFF r 0 0 0.0))
-                        (set! current-step 0))))
-                (set! bpm (gui-property-float "#BPM" 40.0
-                            (exact->inexact bpm) 300.0 1.0 0.5))
-                (gui-label (string-append "Step " (number->string (+ current-step 1)) "/16"))
+              ;; ==== TOOLBAR ====
+              ;; Use nk_begin directly with fixed position to guarantee visibility
+              (gui-begin-panel "Audio DAC" 0.0 0.0 W toolbar-h 8)
+              (gui-row-dynamic row-lg 10)
+              ;; File operations
+              (when (= (gui-button "Save") 1)
+                (save-project! "project.daw" grid bpm track-presets track-volumes))
+              (when (= (gui-button "Load") 1)
+                (load-project! "project.daw" grid track-presets track-volumes backend)
+                (when *loaded-bpm* (set! bpm *loaded-bpm*) (set! *loaded-bpm* #f)))
+              ;; Separator
+              (gui-label "|")
+              ;; Transport
+              (when (= (gui-button (if playing? "Stop" "Play")) 1)
+                (set! playing? (not playing?))
                 (if playing?
-                    (gui-label-colored "PLAYING" 50 200 80)
-                    (gui-label-colored "STOPPED" 140 140 140))
-                ;; Spacers
-                (gui-label "")
-                (gui-label "")
-                (gui-label-colored "Audio DAC" 100 160 220)
-                (gui-end-panel))
+                    (set! last-step-time (c-get-ticks))
+                    (begin
+                      (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
+                        (backend-send backend CMD_ALL_NOTES_OFF r 0 0 0.0))
+                      (set! current-step 0))))
+              (set! bpm (gui-property-float "#BPM" 40.0
+                          (exact->inexact bpm) 300.0 1.0 0.5))
+              (gui-label (string-append "Step " (number->string (+ current-step 1)) "/16"))
+              (if playing?
+                  (gui-label-colored "PLAYING" 50 200 80)
+                  (gui-label-colored "STOPPED" 140 140 140))
+              (gui-label "")
+              (gui-label "")
+              (gui-label-colored "Audio DAC" 100 160 220)
+              (gui-end-panel)
 
               ;; ==== SEQUENCER (with track labels) ====
               (when (gui-begin-panel "Sequencer" 0.0 seq-y seq-w seq-h 8)
