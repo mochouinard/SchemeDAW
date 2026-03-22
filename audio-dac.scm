@@ -177,7 +177,8 @@ void gui_frame_end(void) {
 }
 struct nk_context* gui_get_ctx(void) { return g_ctx; }
 int gui_begin_panel(const char *title, float x, float y, float w, float h, int flags) {
-    nk_flags f = NK_WINDOW_BORDER | NK_WINDOW_TITLE;
+    nk_flags f = NK_WINDOW_BORDER;
+    if (!(flags & 16)) f |= NK_WINDOW_TITLE;  /* 16 = no title bar */
     if (flags & 1) f |= NK_WINDOW_MOVABLE;
     if (flags & 2) f |= NK_WINDOW_SCALABLE;
     if (flags & 4) f |= NK_WINDOW_MINIMIZABLE;
@@ -770,7 +771,7 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                      (row-lg (* 30.0 S))
                      (pad    (* 4.0 S))
                      ;; Layout: toolbar | sequencer+sounds | mixer
-                     (toolbar-h (* 80.0 S))
+                     (toolbar-h (* 50.0 S))
                      (mixer-h   (* 0.28 (- H toolbar-h)))
                      (seq-h     (- H toolbar-h mixer-h))
                      (seq-y     toolbar-h)
@@ -785,8 +786,8 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                      (grid-cell-h (max 14 (inexact->exact
                                     (round (/ (- seq-h (* 80.0 S)) 8.0))))))
 
-              ;; ==== TOOLBAR ====
-              (when (gui-begin-panel "Toolbar" 0.0 0.0 W toolbar-h 8)
+              ;; ==== TOOLBAR (no title bar, flag 24 = 16+8) ====
+              (when (gui-begin-panel "Toolbar" 0.0 0.0 W toolbar-h 24)
                 (gui-row-dynamic row-lg 10)
                 ;; File operations
                 (when (= (gui-button "Save") 1)
