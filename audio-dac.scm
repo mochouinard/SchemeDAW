@@ -439,8 +439,9 @@ float gui_slider_inline(float val, float mn, float mx, float step) {
 (define (save-project! filename grid bpm track-presets track-volumes)
   (call-with-output-file filename
     (lambda (port)
-      (display ";; Audio DAC Project File\n" port)
+      (display ";; Audio DAC Project File v2\n" port)
       (write `(project
+        (version 2)
         (bpm ,bpm)
         (presets ,(vector->list track-presets))
         (volumes ,(map exact->inexact (vector->list track-volumes)))
@@ -594,6 +595,8 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
 ;; ---- Sequencer Grid State (C-allocated for FFI) ----
 (define GRID_ROWS 8)   ;; 8 tracks
 (define GRID_COLS 16)  ;; 16 steps
+(define MAX_PATTERNS 16) ;; up to 16 patterns
+(define MAX_ARRANGEMENT 64) ;; up to 64 slots in arrangement
 
 (define grid-alloc
   (foreign-lambda* c-pointer ((int size))
@@ -711,12 +714,33 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
             (last-step-time (c-get-ticks))
             (track-volumes (make-vector 8 0.8))
             (track-mutes (make-vector 8 #f))
-            (track-solos (make-vector 8 #f)))
+            (track-solos (make-vector 8 #f))
+            ;; Multi-pattern bank: vector of C grid pointers
+            (pattern-bank (let ((bank (make-vector MAX_PATTERNS #f)))
+                            (vector-set! bank 0 grid) ;; pattern 0 = main grid
+                            (do ((i 1 (+ i 1))) ((>= i MAX_PATTERNS))
+                              (vector-set! bank i (grid-alloc (* GRID_ROWS GRID_COLS))))
+                            bank))
+            (current-pattern 0)
+            (num-patterns 4)  ;; start with 4 patterns available
+            ;; Arrangement: list of pattern indices to play in order
+            (arrangement (make-vector MAX_ARRANGEMENT 0))
+            (arrangement-length 4)  ;; default: 4 slots
+            (arrangement-pos 0)     ;; current position in arrangement
+            (arrangement-mode #f)   ;; #f = pattern loop, #t = song mode
+            ;; Per-track FX settings
+            (track-delay (make-vector 8 0.0))    ;; delay mix 0-1
+            (track-reverb (make-vector 8 0.0))   ;; reverb mix 0-1
+            (track-distort (make-vector 8 0.0))) ;; distortion mix 0-1
 
         ;; Set up C row label array and brush notes
         (do ((i 0 (+ i 1))) ((>= i GRID_ROWS))
           (row-labels-set! c-row-labels i (vector-ref grid-row-labels i))
           (int-array-set! c-brush-notes i (vector-ref grid-row-notes i)))
+
+        ;; Default arrangement: P0 P1 P2 P3
+        (do ((i 0 (+ i 1))) ((>= i 4))
+          (vector-set! arrangement i i))
 
         ;; Load presets for all tracks
         (do ((i 0 (+ i 1))) ((>= i GRID_ROWS))
@@ -736,23 +760,36 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
               ;; ---- Sequencer tick (time-based, works when unfocused) ----
               (when playing?
                 (let* ((now (c-get-ticks))
-                       ;; Step duration in ms: at 120 BPM, 16th note = 125ms
                        (step-ms (inexact->exact (round (/ 60000.0 (* bpm 4.0)))))
-                       (elapsed (- now last-step-time)))
-                  ;; Advance as many steps as needed (catches up if window was throttled)
+                       (elapsed (- now last-step-time))
+                       ;; Get the current active grid (from arrangement or current pattern)
+                       (active-grid (if arrangement-mode
+                                        (vector-ref pattern-bank
+                                          (vector-ref arrangement arrangement-pos))
+                                        (vector-ref pattern-bank current-pattern))))
                   (when (>= elapsed step-ms)
                     (let advance-loop ((remaining elapsed))
                       (when (>= remaining step-ms)
-                        ;; Note off previous step (use the actual note stored in the cell)
+                        ;; Note off previous step
                         (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                          (let ((prev-note (grid-get grid (+ (* r GRID_COLS) current-step))))
+                          (let ((prev-note (grid-get active-grid (+ (* r GRID_COLS) current-step))))
                             (when (> prev-note 0)
                               (backend-send backend CMD_NOTE_OFF r prev-note 0 0.0))))
                         ;; Advance step
                         (set! current-step (modulo (+ current-step 1) GRID_COLS))
-                        ;; Note on current step (each cell has its own note value)
+                        ;; Pattern boundary: advance arrangement
+                        (when (= current-step 0)
+                          (when arrangement-mode
+                            (set! arrangement-pos (+ arrangement-pos 1))
+                            (when (>= arrangement-pos arrangement-length)
+                              (set! arrangement-pos 0))
+                            ;; Update active grid for new pattern
+                            (set! active-grid
+                              (vector-ref pattern-bank
+                                (vector-ref arrangement arrangement-pos)))))
+                        ;; Note on current step
                         (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                          (let ((cell-note (grid-get grid (+ (* r GRID_COLS) current-step))))
+                          (let ((cell-note (grid-get active-grid (+ (* r GRID_COLS) current-step))))
                             (when (> cell-note 0)
                               (backend-send backend CMD_NOTE_ON r cell-note 100 0.0))))
                         (advance-loop (- remaining step-ms))))
@@ -770,62 +807,103 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                      (row-sm (* 20.0 S))
                      (row-lg (* 30.0 S))
                      (pad    (* 4.0 S))
-                     ;; Layout: toolbar | sequencer+sounds | mixer
-                     (toolbar-h (* 100.0 S))
-                     (mixer-h   (* 0.28 (- H toolbar-h)))
-                     (seq-h     (- H toolbar-h mixer-h))
-                     (seq-y     toolbar-h)
-                     (mixer-y   (+ toolbar-h seq-h))
-                     ;; Sequencer takes 65% width, sounds 35%
-                     (seq-w     (* 0.65 W))
-                     (sounds-w  (* 0.35 W))
+                     ;; Layout: toolbar | seq+sounds | arrangement | mixer
+                     (toolbar-h  (* 55.0 S))
+                     (arrange-h  (* 70.0 S))
+                     (mixer-h    (* 0.28 (- H toolbar-h arrange-h)))
+                     (seq-h      (- H toolbar-h arrange-h mixer-h))
+                     (seq-y      toolbar-h)
+                     (arrange-y  (+ toolbar-h seq-h))
+                     (mixer-y    (+ arrange-y arrange-h))
+                     ;; Sequencer 60%, sounds 40%
+                     (seq-w     (* 0.60 W))
+                     (sounds-w  (* 0.40 W))
                      ;; Grid cells
                      (label-w   (* 70.0 S))
                      (grid-cell-w (max 16 (inexact->exact
                                     (round (/ (- seq-w label-w (* 50.0 S)) 16.0)))))
                      (grid-cell-h (max 14 (inexact->exact
-                                    (round (/ (- seq-h (* 80.0 S)) 8.0))))))
+                                    (round (/ (- seq-h (* 60.0 S)) 8.0))))))
 
               ;; ==== TOOLBAR ====
-              ;; Use nk_begin directly with fixed position to guarantee visibility
               (gui-begin-panel "Audio DAC" 0.0 0.0 W toolbar-h 8)
-              (gui-row-dynamic row-lg 10)
-              ;; File operations
+              (gui-row-dynamic row-h 12)
+              ;; File
               (when (= (gui-button "Save") 1)
                 (save-project! "project.daw" grid bpm track-presets track-volumes))
               (when (= (gui-button "Load") 1)
                 (load-project! "project.daw" grid track-presets track-volumes backend)
                 (when *loaded-bpm* (set! bpm *loaded-bpm*) (set! *loaded-bpm* #f)))
-              ;; Separator
-              (gui-label "|")
               ;; Transport
               (when (= (gui-button (if playing? "Stop" "Play")) 1)
                 (set! playing? (not playing?))
                 (if playing?
-                    (set! last-step-time (c-get-ticks))
+                    (begin
+                      (set! last-step-time (c-get-ticks))
+                      (when arrangement-mode (set! arrangement-pos 0))
+                      (set! current-step 0))
                     (begin
                       (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
                         (backend-send backend CMD_ALL_NOTES_OFF r 0 0 0.0))
                       (set! current-step 0))))
+              ;; BPM
               (set! bpm (gui-property-float "#BPM" 40.0
                           (exact->inexact bpm) 300.0 1.0 0.5))
-              (gui-label (string-append "Step " (number->string (+ current-step 1)) "/16"))
+              ;; Status
               (if playing?
                   (gui-label-colored "PLAYING" 50 200 80)
                   (gui-label-colored "STOPPED" 140 140 140))
+              ;; Pattern selector
+              (gui-label (string-append "Pat " (number->string (+ current-pattern 1))))
+              (when (= (gui-button "<") 1)
+                (when (> current-pattern 0)
+                  (set! current-pattern (- current-pattern 1))))
+              (when (= (gui-button ">") 1)
+                (when (< current-pattern (- num-patterns 1))
+                  (set! current-pattern (+ current-pattern 1))))
+              ;; Song mode toggle
+              (when (= (gui-button (if arrangement-mode "Song" "Loop")) 1)
+                (set! arrangement-mode (not arrangement-mode)))
+              ;; Step display
+              (gui-label (string-append
+                (number->string (+ current-step 1)) "/16"
+                (if arrangement-mode
+                    (string-append " S:" (number->string (+ arrangement-pos 1)))
+                    "")))
               (gui-label "")
-              (gui-label "")
-              (gui-label-colored "Audio DAC" 100 160 220)
               (gui-end-panel)
 
               ;; ==== SEQUENCER (with track labels) ====
-              (when (gui-begin-panel "Sequencer" 0.0 seq-y seq-w seq-h 8)
-                ;; Use the labeled grid
-                (gui-sequencer-grid-labeled-raw
-                  grid GRID_ROWS GRID_COLS
-                  (if playing? current-step -1)
-                  grid-cell-w grid-cell-h
-                  c-row-labels S c-brush-notes)
+              (when (gui-begin-panel
+                      (string-append "Pattern " (number->string (+ current-pattern 1)))
+                      0.0 seq-y seq-w seq-h 8)
+                ;; Use current pattern's grid
+                (let ((active-edit-grid (vector-ref pattern-bank current-pattern)))
+                  (gui-sequencer-grid-labeled-raw
+                    active-edit-grid GRID_ROWS GRID_COLS
+                    (if (and playing? (not arrangement-mode)
+                             (= current-pattern current-pattern))
+                        current-step -1)
+                    grid-cell-w grid-cell-h
+                    c-row-labels S c-brush-notes))
+                ;; Pattern management buttons
+                (gui-row-dynamic row-sm 6)
+                (when (= (gui-button "Clear Pat") 1)
+                  (let ((g (vector-ref pattern-bank current-pattern)))
+                    (do ((i 0 (+ i 1))) ((>= i (* GRID_ROWS GRID_COLS)))
+                      (grid-set! g i 0))))
+                (when (= (gui-button "Copy ->") 1)
+                  (when (< current-pattern (- num-patterns 1))
+                    (let ((src (vector-ref pattern-bank current-pattern))
+                          (dst (vector-ref pattern-bank (+ current-pattern 1))))
+                      (do ((i 0 (+ i 1))) ((>= i (* GRID_ROWS GRID_COLS)))
+                        (grid-set! dst i (grid-get src i))))))
+                (when (= (gui-button "+Pat") 1)
+                  (when (< num-patterns MAX_PATTERNS)
+                    (set! num-patterns (+ num-patterns 1))))
+                (gui-label (string-append (number->string num-patterns) " patterns"))
+                (gui-label "")
+                (gui-label "")
                 (gui-end-panel))
 
               ;; ==== SOUNDS PANEL ====
@@ -890,26 +968,63 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                           (vector-set! track-presets r pi)
                           (backend-send backend CMD_LOAD_PRESET r pi 0 0.0))))))
 
-                ;; Filter at bottom
-                (gui-separator (* 5.0 S))
+                ;; Filter
+                (gui-separator (* 3.0 S))
                 (gui-row-dynamic (* 14.0 S) 1)
-                (gui-label-colored "Filter" 120 160 200)
+                (gui-label-colored "Global Filter" 120 160 200)
                 (let ((new-cutoff (gui-slider "Cutoff"
                                     (exact->inexact cutoff) 20.0 20000.0 10.0)))
                   (when (not (= new-cutoff cutoff))
                     (set! cutoff new-cutoff)
-                    (backend-send backend CMD_SET_FILTER 0 0 0 cutoff)))
+                    ;; Apply to all tracks
+                    (do ((t 0 (+ t 1))) ((>= t GRID_ROWS))
+                      (backend-send backend CMD_SET_FILTER t 0 0 cutoff))))
                 (let ((new-reso (gui-slider "Reso"
                                   (exact->inexact resonance) 0.0 0.95 0.01)))
                   (when (not (= new-reso resonance))
                     (set! resonance new-reso)
-                    (backend-send backend CMD_SET_FILTER 0 1 0 resonance)))
+                    (do ((t 0 (+ t 1))) ((>= t GRID_ROWS))
+                      (backend-send backend CMD_SET_FILTER t 1 0 resonance))))
                 (gui-end-panel))
+
+              ;; ==== ARRANGEMENT (Song Timeline) ====
+              (gui-begin-panel "Arrangement" 0.0 arrange-y W arrange-h 8)
+              (gui-row-dynamic row-sm 1)
+              (gui-label-colored
+                (string-append "Song Timeline ("
+                  (number->string arrangement-length) " bars) "
+                  (if arrangement-mode "[SONG MODE]" "[LOOP MODE - click Song to enable]"))
+                120 180 220)
+              ;; Arrangement slots as clickable buttons
+              (gui-row-dynamic row-h (min arrangement-length 16))
+              (do ((s 0 (+ s 1))) ((>= s (min arrangement-length 16)))
+                (let* ((pat-idx (vector-ref arrangement s))
+                       (is-playing (and playing? arrangement-mode (= s arrangement-pos)))
+                       (label (string-append
+                                (if is-playing ">" "")
+                                "P" (number->string (+ pat-idx 1)))))
+                  ;; Click to cycle pattern assignment
+                  (when (= (gui-button label) 1)
+                    (vector-set! arrangement s
+                      (modulo (+ pat-idx 1) num-patterns)))))
+              ;; Arrangement length controls
+              (gui-row-dynamic row-sm 6)
+              (gui-label "Length:")
+              (when (= (gui-button "-") 1)
+                (when (> arrangement-length 1)
+                  (set! arrangement-length (- arrangement-length 1))))
+              (when (= (gui-button "+") 1)
+                (when (< arrangement-length MAX_ARRANGEMENT)
+                  (set! arrangement-length (+ arrangement-length 1))))
+              (gui-label (string-append (number->string arrangement-length) " bars"))
+              (gui-label "")
+              (gui-label "")
+              (gui-end-panel)
 
               ;; ==== MIXER ====
               (when (gui-begin-panel "Mixer" 0.0 mixer-y W mixer-h 8)
                 (do ((i 0 (+ i 1))) ((>= i 8))
-                  (gui-row-dynamic row-h 7)
+                  (gui-row-dynamic row-h 8)
                   ;; Mute
                   (let ((m (vector-ref track-mutes i)))
                     (when (= (gui-button (if m "M!" "M ")) 1)
@@ -922,10 +1037,11 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                       (backend-send backend CMD_SOLO_TRACK i (if (not s) 1 0) 0 0.0)))
                   ;; Track name + preset
                   (gui-label-colored
-                    (string-append (vector-ref grid-row-labels i) " - "
+                    (string-append (number->string (+ i 1)) ". "
+                      (vector-ref grid-row-labels i) " - "
                       (vector-ref preset-names (vector-ref track-presets i)))
                     (if (< i 4) 80 220) (if (< i 4) 180 160) (if (< i 4) 220 80))
-                  ;; Volume (inline slider, no layout row)
+                  ;; Volume
                   (let* ((vol (vector-ref track-volumes i))
                          (new-vol (gui-slider-inline
                                     (exact->inexact vol) 0.0 1.0 0.01)))
@@ -933,26 +1049,36 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                       (vector-set! track-volumes i new-vol)
                       (backend-send backend CMD_SET_VOLUME i 0 0
                         (exact->inexact new-vol))))
-                  ;; Volume label
+                  ;; Volume %
                   (gui-label (string-append
                     (number->string (inexact->exact (round (* (vector-ref track-volumes i) 100.0))))
-                    "%")))
+                    "%"))
+                  ;; VU meter placeholder (shows volume level as visual bar)
+                  (gui-meter ""
+                    (exact->inexact (* (vector-ref track-volumes i)
+                                       (if (vector-ref track-mutes i) 0.0 1.0))))
+                  ;; Pan placeholder
+                  (gui-label "C"))
                 (gui-end-panel))
 
               ) ;; end let* for layout dimensions
 
               (gui-frame-end)
 
-              (loop)))))) ;; loop, unless, let-quit, let-loop, let-track-presets
-
-        ;; Cleanup
-        (int-array-free c-brush-notes)
-        (row-labels-free c-row-labels GRID_ROWS)
-        (grid-free grid)
-        (backend-stop backend)
-        (gui-shutdown)
-        (backend-destroy backend)
-        (format #t "Goodbye.~%")))) ;; let-state, let-grid, let-backend, main-gui
+              (loop)))))   ;; close: loop-body, unless, let-quit, let-loop, let-track-presets
+        ;; Cleanup pattern bank (in DAW state let scope)
+        (do ((i 1 (+ i 1))) ((>= i MAX_PATTERNS))
+          (let ((g (vector-ref pattern-bank i)))
+            (when g (grid-free g)))))
+      ;; Cleanup C arrays (in grid let scope)
+      (int-array-free c-brush-notes)
+      (row-labels-free c-row-labels GRID_ROWS)
+      (grid-free grid))
+    ;; Final cleanup (in backend let scope)
+    (backend-stop backend)
+    (gui-shutdown)
+    (backend-destroy backend)
+    (format #t "Goodbye.~%")))
 
 ;; Run
 (main)
