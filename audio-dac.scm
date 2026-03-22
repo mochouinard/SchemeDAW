@@ -680,7 +680,7 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                      (row-lg (* 30.0 S))
                      (pad    (* 4.0 S))
                      ;; Layout: toolbar | sequencer+sounds | mixer
-                     (toolbar-h (* 50.0 S))
+                     (toolbar-h (* 80.0 S))
                      (mixer-h   (* 0.28 (- H toolbar-h)))
                      (seq-h     (- H toolbar-h mixer-h))
                      (seq-y     toolbar-h)
@@ -709,10 +709,14 @@ unsigned int c_get_ticks(void) { return SDL_GetTicks(); }
                 ;; Transport
                 (when (= (gui-button (if playing? "Stop" "Play")) 1)
                   (set! playing? (not playing?))
-                  (when (not playing?)
-                    (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
-                      (backend-send backend CMD_ALL_NOTES_OFF r 0 0 0.0))
-                    (set! current-step 0)))
+                  (if playing?
+                      ;; Starting: reset timer to now so we don't catch up
+                      (set! last-step-time (c-get-ticks))
+                      ;; Stopping: all notes off, reset position
+                      (begin
+                        (do ((r 0 (+ r 1))) ((>= r GRID_ROWS))
+                          (backend-send backend CMD_ALL_NOTES_OFF r 0 0 0.0))
+                        (set! current-step 0))))
                 (set! bpm (gui-property-float "#BPM" 40.0
                             (exact->inexact bpm) 300.0 1.0 0.5))
                 (gui-label (string-append "Step " (number->string (+ current-step 1)) "/16"))
